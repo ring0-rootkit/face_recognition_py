@@ -306,7 +306,7 @@ class FaceRegistrationDialog(QDialog):
         if self.is_recognized:
             time_left = max(0, self.required_recognition_time - (time.time() - self.green_start_time))
             self.progress_label.setText(f"Face recognized! Keep position for {time_left:.1f} seconds")
-            self.progress_label.setStyleSheet("margin-top: 10px; color: #00FF00; font-weight: bold;")
+            self.progress_label.setStyleSheet("margin-top: 10px; color: #00CC00; font-weight: bold;")  # Darker green for better readability
         else:
             self.progress_label.setText(f"Photos taken: {self.taken_photos} - Move your face around")
             self.progress_label.setStyleSheet("margin-top: 10px; color: white;")
@@ -431,7 +431,8 @@ class FaceRegistrationDialog(QDialog):
     
     def check_take_photo(self):
         """Timer callback to take photo every 0.5 seconds if needed"""
-        if self.current_image is None or self.last_face_location is None:
+        # Don't take photos if completion dialog has been shown or face is recognized for required time
+        if self.completion_dialog_shown or (self.current_image is None or self.last_face_location is None):
             return
             
         # Skip taking photo if face is already recognized for required time
@@ -443,6 +444,10 @@ class FaceRegistrationDialog(QDialog):
             
     def take_photo(self, face_location):
         """Take a photo of the detected face and retrain"""
+        # Prevent taking photos if the completion dialog has been shown
+        if self.completion_dialog_shown:
+            return
+            
         x, y, w, h = face_location
             
         # If we're using a cropped image in display_image_with_rect, we need to extract
@@ -465,7 +470,8 @@ class FaceRegistrationDialog(QDialog):
             # Add the face and wait for retraining to complete
             await self.parent().face_recognizer.add_face_and_wait(face_img, self.name)
             # Update UI after retraining is complete
-            self.update_progress()
+            if not self.completion_dialog_shown:  # Only update if not completed
+                self.update_progress()
             
         # Start the task
         create_task(add_face_and_retrain())
@@ -573,6 +579,10 @@ class FaceRegistrationDialog(QDialog):
                             self.process_timer.stop()
                             self.photo_timer.stop()
                             
+                            # Check if completion dialog has already been shown to avoid duplicates
+                            if self.completion_dialog_shown:
+                                return
+                                
                             # Set flag to indicate completion dialog has been shown
                             self.completion_dialog_shown = True
                             
@@ -622,7 +632,7 @@ class FaceRegistrationDialog(QDialog):
         # Set instruction based on recognition state
         if self.is_recognized:
             self.instructions.setText("Face recognized! Keep position.")
-            self.instructions.setStyleSheet("margin-bottom: 10px; color: #00FF00; font-weight: bold;")
+            self.instructions.setStyleSheet("margin-bottom: 10px; color: #00CC00; font-weight: bold;")  # Darker green for better readability
         else:
             self.instructions.setText("Keep moving your face until it's recognized (green rectangle).")
             self.instructions.setStyleSheet("margin-bottom: 10px; color: white;")
@@ -678,14 +688,14 @@ class RecognitionPopupDialog(QDialog):
         # Convert confidence to percentage (higher is better)
         confidence_pct = max(0, min(100, 100 - confidence))
         
-        # Info text with colorized confidence
+        # Info text with colorized confidence - use darker colors for better readability
         confidence_html = f"<span style='color:"
         if confidence_pct >= 90:
-            confidence_html += "#00FF00'>Excellent Match"  # Green
+            confidence_html += "#00CC00'>Excellent Match"  # Darker Green
         elif confidence_pct >= 75:
-            confidence_html += "#FFFF00'>Good Match"  # Yellow
+            confidence_html += "#DDDD00'>Good Match"  # Darker Yellow
         else:
-            confidence_html += "#FFA500'>Low Confidence Match"  # Orange
+            confidence_html += "#DD7700'>Low Confidence Match"  # Darker Orange
         confidence_html += f" ({confidence_pct:.1f}%)</span>"
         
         info_text = ModernLabel(f"<html><body><h2>{name}</h2>{confidence_html}</body></html>")
@@ -723,6 +733,8 @@ class FaceRecognitionGUI(QMainWindow):
         self.is_scanning = True
         self.active_dialogs = 0
         self.current_image = None
+
+        self.use_gpu = True
         
         # Initialize variables for multiple image updates
         self.update_timer = None
@@ -739,8 +751,8 @@ class FaceRecognitionGUI(QMainWindow):
             with open(metadata_path, 'w') as f:
                 json.dump([], f)
         
-        # Initialize face recognition
-        self.face_recognizer = FaceRecognition("faces/")
+        # Initialize face recognition with GPU acceleration enabled by default
+        self.face_recognizer = FaceRecognition("faces/", use_gpu=True)
         
         # Start loading database in background
         self.loading_task = self.face_recognizer.start_loading_database()
@@ -828,11 +840,44 @@ class FaceRecognitionGUI(QMainWindow):
         self.lock_button.setCheckable(True)
         self.lock_button.clicked.connect(self.toggle_lock)
         
+        # GPU toggle button
+        self.gpu_button = ModernButton("Use CPU")  # Initially GPU is enabled
+        self.gpu_button.setCheckable(True)
+        self.gpu_button.setChecked(True)  # Default to checked/enabled
+        self.gpu_button.clicked.connect(self.toggle_gpu)
+        self.gpu_button.setStyleSheet("""
+            QPushButton {
+                background-color: #673AB7;
+                color: white;
+                border: none;
+                padding: 10px 20px;
+                border-radius: 5px;
+                font-size: 14px;
+                font-weight: bold;
+            }
+            QPushButton:hover {
+                background-color: #5E35B1;
+            }
+            QPushButton:pressed {
+                background-color: #512DA8;
+            }
+            QPushButton:checked {
+                background-color: #4CAF50;
+            }
+            QPushButton:checked:hover {
+                background-color: #43A047;
+            }
+            QPushButton:disabled {
+                background-color: #BDBDBD;
+            }
+        """)
+        
         # Create button layouts
         button_layout = QGridLayout()
         button_layout.addWidget(self.add_button, 0, 0)
         button_layout.addWidget(self.delete_button, 0, 1)
         button_layout.addWidget(self.lock_button, 1, 0, 1, 2)  # Span both columns
+        button_layout.addWidget(self.gpu_button, 2, 0, 1, 2)  # Span both columns
         middle_layout.addLayout(button_layout)
         
         # Right panel (Recognized Faces)
@@ -1258,11 +1303,9 @@ class FaceRecognitionGUI(QMainWindow):
             
         # Check if face already exists
         if name in self.face_recognizer.known_face_names:
-            reply = QMessageBox.question(self, 'Face Exists', 
-                f'Face "{name}" already exists. Do you want to add more photos?',
-                QMessageBox.Yes | QMessageBox.No)
-            if reply == QMessageBox.No:
-                return
+            reply = QMessageBox.warning(self, 'Face Exists', 
+                f'Face "{name}" already exists')
+            return
         
         # Create person directory if it doesn't exist
         person_dir = Path("faces/faces") / name
@@ -1564,14 +1607,14 @@ class FaceRecognitionGUI(QMainWindow):
         # Calculate confidence percentage (higher is better)
         confidence_pct = max(0, min(100, 100 - self.locked_confidence))
         
-        # Create name and confidence label with styling based on confidence
+        # Create name and confidence label with styling based on confidence - using darker colors for better contrast
         confidence_html = f"<span style='color:"
         if confidence_pct >= 90:
-            confidence_html += "#00FF00'>Excellent Match"  # Green
+            confidence_html += "#00CC00'>Excellent Match"  # Darker Green
         elif confidence_pct >= 75:
-            confidence_html += "#FFFF00'>Good Match"  # Yellow
+            confidence_html += "#DDDD00'>Good Match"  # Darker Yellow
         else:
-            confidence_html += "#FFA500'>Low Confidence Match"  # Orange
+            confidence_html += "#DD7700'>Low Confidence Match"  # Darker Orange
         confidence_html += f" ({confidence_pct:.1f}%)</span>"
         
         info_label = ModernLabel(f"<html><body><h3>{self.locked_name}</h3>{confidence_html}<br><b>(Locked)</b></body></html>")
@@ -1617,6 +1660,45 @@ class FaceRecognitionGUI(QMainWindow):
         
         info_layout.addWidget(info_label)
         self.recognized_faces_layout.addWidget(info_frame)
+
+    def toggle_gpu(self):
+        """Toggle GPU acceleration for face recognition"""
+        use_gpu = not self.face_recognizer.use_gpu
+        # Update button text based on new state
+        self.gpu_button.setText("Use GPU" if use_gpu else "Use CPU")
+        
+        # Only reinitialize if there's a change
+        self.status_label.setText(f"Updating GPU acceleration setting to: {'Enabled' if use_gpu else 'Disabled'}...")
+        
+        # Reinitialize the face recognizer with the new GPU setting
+        # First, save the current state
+        database_dir = self.face_recognizer.database_dir
+        
+        # Cleanup the current face recognizer
+        self.face_recognizer.cleanup()
+        
+        # Create a new face recognizer with the updated GPU setting
+        self.face_recognizer = FaceRecognition(database_dir, use_gpu=use_gpu)
+        
+        # Start loading database in background
+        self.loading_task = self.face_recognizer.start_loading_database()
+        
+        # Schedule an update of the status after loading completes
+        async def update_status_after_loading():
+            await self.loading_task
+            if self.face_recognizer.has_gpu and use_gpu:
+                self.status_label.setText(f"GPU acceleration enabled and ready")
+                self.gpu_button.setText("Use CPU")  # Update text to show alternative option
+            else:
+                self.status_label.setText(f"Using CPU for face recognition")
+                self.gpu_button.setText("Use GPU")  # Update text to show alternative option
+            
+            self.use_gpu = use_gpu
+                
+            # Update the combo box after loading is complete
+            self.update_people_combo()
+            
+        create_task(update_status_after_loading())
 
 def main():
     """Main application entry point with asyncio-Qt integration"""

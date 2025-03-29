@@ -17,14 +17,49 @@ def create_task(coro):
         return asyncio.ensure_future(coro)
 
 class FaceRecognition:
-    def __init__(self, database_dir: str = "faces/"):
+    def __init__(self, database_dir: str = "faces/", use_gpu: bool = True):
         self.database_dir = database_dir
         self.faces_dir = os.path.join(database_dir, "faces")
         self.metadata_file = os.path.join(database_dir, "metadata.json")
         os.makedirs(self.faces_dir, exist_ok=True)
         
+        # GPU usage configuration
+        self.use_gpu = use_gpu
+        self.has_gpu = False
+        self.gpu_device_id = 0
+        
+        # Check if GPU (CUDA) is available if requested
+        if self.use_gpu:
+            try:
+                # Check if OpenCV was built with CUDA support
+                if cv2.cuda.getCudaEnabledDeviceCount() > 0:
+                    self.has_gpu = True
+                    print(f"✅ GPU acceleration enabled with {cv2.cuda.getCudaEnabledDeviceCount()} CUDA device(s)")
+                    # Initialize CUDA device
+                    cv2.cuda.setDevice(self.gpu_device_id)
+                    # Create a CUDA Stream for asynchronous operations
+                    self.cuda_stream = cv2.cuda.Stream()
+                else:
+                    self.has_gpu = False
+                    self.use_gpu = False
+                    print("⚠️ GPU acceleration requested but no CUDA devices found. Falling back to CPU.")
+            except Exception as e:
+                self.has_gpu = False
+                self.use_gpu = False
+                print(f"⚠️ Error initializing GPU: {e}. Falling back to CPU.")
+        
         # Initialize face detector
         self.face_detector = cv2.CascadeClassifier(cv2.data.haarcascades + "haarcascade_frontalface_default.xml")
+        
+        # Initialize GPU-accelerated face detector if available
+        if self.has_gpu:
+            try:
+                # For GPU, we can use CUDA-accelerated functions
+                # Note: OpenCV doesn't have a direct CUDA CascadeClassifier, but we can accelerate other parts
+                print("✅ GPU acceleration ready for image processing operations")
+            except Exception as e:
+                print(f"⚠️ Could not initialize GPU acceleration: {e}. Using CPU only.")
+                self.has_gpu = False  # Disable GPU if initialization fails
         
         # Initialize face recognizer
         self.face_recognizer = cv2.face.LBPHFaceRecognizer_create()
@@ -127,12 +162,44 @@ class FaceRecognition:
 
     def _detect_face(self, gray_image: np.ndarray) -> List[Tuple[int, int, int, int]]:
         """Wrapper function for face detection with specific parameters"""
-        return self.face_detector.detectMultiScale(
+        # Use GPU acceleration if available
+        if self.has_gpu:
+            try:
+                # Upload image to GPU memory
+                gpu_gray = cv2.cuda_GpuMat()
+                gpu_gray.upload(gray_image)
+                
+                # Apply CUDA-accelerated operations for preprocessing
+                # Use GPU-accelerated image equalization to improve detection
+                gpu_equalized = cv2.cuda.equalizeHist(gpu_gray)
+                
+                # Since OpenCV's GPU CascadeClassifier is not fully compatible,
+                # we'll download back to CPU for the actual detection
+                equalized_gray = gpu_equalized.download()
+                
+                # Perform detection on the preprocessed image
+                faces = self.face_detector.detectMultiScale(
+                    equalized_gray,
+                    scaleFactor=1.1,
+                    minNeighbors=5,
+                    minSize=(30, 30)
+                )
+                
+                print(f"GPU-accelerated face detection found {len(faces)} faces")
+                return faces
+            except Exception as e:
+                print(f"Error in GPU face detection: {e}. Falling back to CPU.")
+                # Fall back to CPU if GPU detection fails
+        
+        # Standard CPU detection
+        faces = self.face_detector.detectMultiScale(
             gray_image,
             scaleFactor=1.1,
             minNeighbors=5,
             minSize=(30, 30)
         )
+        print(f"CPU face detection found {len(faces)} faces")
+        return faces
 
     async def _process_face(self, feature_path: str, name: str, current_label: int) -> Optional[Tuple[np.ndarray, int, str]]:
         """Process a single face feature file asynchronously"""
@@ -260,6 +327,29 @@ class FaceRecognition:
     async def _preprocess_face(self, face: np.ndarray) -> np.ndarray:
         """Preprocess face image for recognition"""
         loop = asyncio.get_event_loop()
+        
+        # Use GPU acceleration if available
+        if self.has_gpu:
+            try:
+                # Process on GPU directly without using thread pool
+                # Upload to GPU
+                gpu_face = cv2.cuda_GpuMat()
+                gpu_face.upload(face)
+                
+                # Resize on GPU
+                gpu_resized = cv2.cuda.resize(gpu_face, (100, 100))
+                
+                # Equalize histogram on GPU
+                gpu_equalized = cv2.cuda.equalizeHist(gpu_resized)
+                
+                # Download result back to CPU
+                processed_face = gpu_equalized.download()
+                return processed_face
+            except Exception as e:
+                print(f"Error in GPU face preprocessing: {e}. Falling back to CPU.")
+                # Fall back to CPU if GPU processing fails
+        
+        # Standard CPU processing with thread pool
         # Resize to standard size
         face = await loop.run_in_executor(
             self.thread_pool,
@@ -301,17 +391,40 @@ class FaceRecognition:
             print("Face recognizer is not trained yet")
             return []
 
-        loop = asyncio.get_event_loop()
-        # Convert to grayscale in thread pool
-        gray = await loop.run_in_executor(
-            self.thread_pool,
-            cv2.cvtColor,
-            image,
-            cv2.COLOR_BGR2GRAY
-        )
+        # Convert to grayscale (using GPU if available)
+        if self.has_gpu:
+            try:
+                # Upload to GPU
+                gpu_image = cv2.cuda_GpuMat()
+                gpu_image.upload(image)
+                
+                # Convert to grayscale on GPU
+                gpu_gray = cv2.cuda.cvtColor(gpu_image, cv2.COLOR_BGR2GRAY)
+                
+                # Download result
+                gray = gpu_gray.download()
+            except Exception as e:
+                print(f"Error in GPU grayscale conversion: {e}. Falling back to CPU.")
+                # Fall back to CPU
+                loop = asyncio.get_event_loop()
+                gray = await loop.run_in_executor(
+                    self.thread_pool,
+                    cv2.cvtColor,
+                    image,
+                    cv2.COLOR_BGR2GRAY
+                )
+        else:
+            # CPU conversion
+            loop = asyncio.get_event_loop()
+            gray = await loop.run_in_executor(
+                self.thread_pool,
+                cv2.cvtColor,
+                image,
+                cv2.COLOR_BGR2GRAY
+            )
         
-        # Detect faces
-        faces = self.detect_faces(image)
+        # Detect faces (already GPU-accelerated in the _detect_face method if possible)
+        faces = self._detect_face(gray)
         if len(faces) == 0:
             return []
             
