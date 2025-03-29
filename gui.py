@@ -951,7 +951,10 @@ class FaceRecognitionGUI(QMainWindow):
         if self.is_locked and self.locked_face is not None:
             # Display locked face in the recognized faces panel
             self.display_locked_face()
-        self.display_image(frame)
+        
+        # Only update the main camera frame if not in face registration mode
+        if not hasattr(self, 'in_face_registration') or not self.in_face_registration:
+            self.display_image(frame)
 
     def load_image(self):
         file_path, _ = QFileDialog.getOpenFileName(
@@ -1315,6 +1318,29 @@ class FaceRecognitionGUI(QMainWindow):
         # Signal to the user that we're entering registration mode
         self.dialog_opened()  # Pause normal scanning
         self.status_label.setText(f"Starting face registration for {name}...")
+        
+        # Set flag to disable main camera frame updates
+        self.in_face_registration = True
+        
+        # Clear the main camera display
+        blank_image = np.zeros((480, 640, 3), dtype=np.uint8)
+        blank_image[:] = (45, 45, 45)  # Dark gray background
+        
+        # Add text to blank image
+        font = cv2.FONT_HERSHEY_SIMPLEX
+        text = "Face Registration in Progress"
+        text_size = cv2.getTextSize(text, font, 1, 2)[0]
+        text_x = (blank_image.shape[1] - text_size[0]) // 2
+        text_y = (blank_image.shape[0] + text_size[1]) // 2
+        cv2.putText(blank_image, text, (text_x, text_y), font, 1, (255, 255, 255), 2)
+        
+        # Convert to RGB and display
+        rgb_image = cv2.cvtColor(blank_image, cv2.COLOR_BGR2RGB)
+        h, w, ch = rgb_image.shape
+        bytes_per_line = ch * w
+        qt_image = QImage(rgb_image.data, w, h, bytes_per_line, QImage.Format.Format_RGB888)
+        pixmap = QPixmap.fromImage(qt_image)
+        self.image_label.setPixmap(pixmap)
             
         # Create registration dialog
         dialog = FaceRegistrationDialog(self)
@@ -1345,7 +1371,12 @@ class FaceRecognitionGUI(QMainWindow):
                 pass
         else:
             QMessageBox.critical(self, "Error", "Camera could not be started or is not available")
+            # Reset the flag
+            self.in_face_registration = False
             return
+        
+        # Reset the flag to enable main camera frame again
+        self.in_face_registration = False
         
         # Resume normal scanning
         self.dialog_closed()
