@@ -11,6 +11,9 @@ from PyQt6.QtGui import QImage, QPixmap, QFont, QIcon, QPalette, QColor
 import time
 from pathlib import Path
 import json
+import asyncio
+import qasync
+from qasync import QEventLoop
 
 class CameraThread(QThread):
     frame_ready = pyqtSignal(np.ndarray)
@@ -356,6 +359,9 @@ class FaceRecognitionGUI(QMainWindow):
         # Initialize face recognition
         self.face_recognizer = FaceRecognition("faces/")
         
+        # Start loading database in background
+        self.loading_task = self.face_recognizer.start_loading_database()
+        
         # Create main widget and layout
         main_widget = QWidget()
         self.setCentralWidget(main_widget)
@@ -582,18 +588,34 @@ class FaceRecognitionGUI(QMainWindow):
                 self.detection_counter = 0
                 # Update last known faces
                 self.last_detected_faces = self.face_recognizer.detect_faces(image)
-                results = self.face_recognizer.recognize_face(image)
-                self.last_recognized_faces = [(x, y, w, h) for _, _, (x, y, w, h) in results]
+                # Create task for face recognition
+                async def update_recognition():
+                    self.last_recognized_faces = await self.face_recognizer.recognize_face(image)
+                asyncio.create_task(update_recognition())
             
             # Draw rectangles for all detected faces
             for (x, y, w, h) in self.last_detected_faces:
                 # Check if face is recognized
-                if (x, y, w, h) in self.last_recognized_faces:
+                recognized = False
+                name = None
+                for result in self.last_recognized_faces:
+                    if (x, y, w, h) == result[2]:  # Compare face locations
+                        recognized = True
+                        name = result[0]  # Get name from result
+                        break
+                
+                if recognized:
                     # Draw green rectangle for recognized faces
                     cv2.rectangle(display_image, (x, y), (x+w, y+h), (0, 255, 0), 2)
+                    # Add name above the rectangle
+                    cv2.putText(display_image, name, (x, y-10), 
+                              cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
                 else:
                     # Draw red rectangle for unrecognized faces
                     cv2.rectangle(display_image, (x, y), (x+w, y+h), (0, 0, 255), 2)
+                    # Add "Unknown" text above the rectangle
+                    cv2.putText(display_image, "Unknown", (x, y-10), 
+                              cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 2)
         
         # Convert BGR to RGB
         image_rgb = cv2.cvtColor(display_image, cv2.COLOR_BGR2RGB)
@@ -692,36 +714,34 @@ class FaceRecognitionGUI(QMainWindow):
         # Disconnect camera frame
         self.camera_thread.frame_ready.disconnect(dialog.set_image)
 
-    def recognize_face(self):
+    async def recognize_face(self):
         if self.current_image is None:
             QMessageBox.warning(self, "Warning", "Please load or capture an image first")
             return
             
-        results = self.face_recognizer.recognize_face(self.current_image)
+        results = await self.face_recognizer.recognize_face(self.current_image)
         
         if not results:
             QMessageBox.warning(self, "Warning", "No faces detected or confidence too low")
             return
             
-        # Get the best match
-        best_result = min(results, key=lambda x: x[1])
-        name, confidence, (x, y, w, h) = best_result
-        
-        if confidence <= 75:  # Lower confidence means better match
-            # Extract face region
-            face_img = self.current_image[y:y+h, x:x+w]
-            # Show popup
-            dialog = RecognitionPopupDialog(name, confidence, face_img, self)
-            self.dialog_opened()
-            dialog.exec()
-            self.dialog_closed()
-            
-            # Enable lock button
-            self.lock_button.setEnabled(True)
-            # Store locked face data
-            self.locked_face = face_img
-            self.locked_name = name
-            self.locked_confidence = confidence
+        # Process all recognized faces
+        for name, confidence, (x, y, w, h) in results:
+            if confidence <= 75:  # Lower confidence means better match
+                # Extract face region
+                face_img = self.current_image[y:y+h, x:x+w]
+                # Show popup for each recognized face
+                dialog = RecognitionPopupDialog(name, confidence, face_img, self)
+                self.dialog_opened()
+                await qasync.asyncSlot()(dialog.exec)()
+                self.dialog_closed()
+                
+                # Enable lock button for the last recognized face
+                self.lock_button.setEnabled(True)
+                # Store locked face data
+                self.locked_face = face_img
+                self.locked_name = name
+                self.locked_confidence = confidence
 
     def delete_face(self):
         name = self.name_entry.text().strip()
@@ -785,10 +805,10 @@ class FaceRecognitionGUI(QMainWindow):
 
     def update_metadata(self):
         """Update the face recognition system with new metadata"""
-        # Reinitialize face recognition with updated metadata
-        self.face_recognizer = FaceRecognition("faces/")
+        # Start loading database in background
+        self.loading_task = self.face_recognizer.start_loading_database()
 
-    def check_for_faces(self):
+    async def check_for_faces(self):
         if not self.is_scanning or self.current_image is None or self.active_dialogs > 0:
             return
             
@@ -800,8 +820,8 @@ class FaceRecognitionGUI(QMainWindow):
                 self.last_face_detection = current_time
                 self.face_detected_time = current_time
             elif current_time - self.face_detected_time >= 1.0:  # Face detected for 1 second
-                # Try to recognize the face
-                results = self.face_recognizer.recognize_face(self.current_image)
+                # Try to recognize the faces
+                results = await self.face_recognizer.recognize_face(self.current_image)
                 if results:
                     # Get the result with highest confidence
                     best_result = min(results, key=lambda x: x[1])
@@ -824,9 +844,18 @@ class FaceRecognitionGUI(QMainWindow):
 
 def main():
     app = QApplication(sys.argv)
+    
+    # Create event loop
+    loop = QEventLoop(app)
+    asyncio.set_event_loop(loop)
+    
+    # Create and show the main window
     window = FaceRecognitionGUI()
     window.show()
-    sys.exit(app.exec())
+    
+    # Run the event loop
+    with loop:
+        loop.run_forever()
 
-if __name__ == "__main__":
+if __name__ == '__main__':
     main()

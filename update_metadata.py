@@ -31,7 +31,11 @@ def update_metadata():
                 person_entry = {
                     "name": person_name,
                     "photos": ["front"]  # Add front photo
+                son_name,
+                    "photos": ["front"]  # Add front photo
                 }
+                
+                # Add all other }
                 
                 # Add all other photos for this person
                 for other_photo in faces_dir.glob(f"{person_name}_*.jpg"):
