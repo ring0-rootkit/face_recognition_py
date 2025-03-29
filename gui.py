@@ -103,7 +103,11 @@ class ModernComboBox(QComboBox):
                 border-left-style: solid;
             }
             QComboBox::down-arrow {
-                image: url(down_arrow.png);
+                /* Use no image but define the arrow as a Unicode character */
+                image: none;
+                color: white;
+                width: 12px;
+                height: 12px;
             }
             QComboBox QAbstractItemView {
                 background-color: #424242;
@@ -111,8 +115,68 @@ class ModernComboBox(QComboBox):
                 selection-background-color: #2196F3;
                 selection-color: white;
                 border: none;
+                outline: none;
+                padding: 5px;
+            }
+            QComboBox QListView {
+                background-color: #424242;
+                color: white;
+            }
+            QComboBox QListView::item {
+                background-color: #424242;
+                color: white;
+                padding: 5px;
+            }
+            QComboBox QListView::item:hover {
+                background-color: #616161;
+            }
+            QComboBox QListView::item:selected {
+                background-color: #2196F3;
+            }
+            QComboBox QScrollBar:vertical {
+                border: none;
+                background-color: #424242;
+                width: 10px;
+                margin: 0px;
+            }
+            QComboBox QScrollBar::handle:vertical {
+                background-color: #666666;
+                border-radius: 5px;
+                min-height: 20px;
+            }
+            QComboBox QScrollBar::handle:vertical:hover {
+                background-color: #888888;
+            }
+            QComboBox QScrollBar::add-line:vertical, QComboBox QScrollBar::sub-line:vertical {
+                height: 0px;
             }
         """)
+        
+        # Set a proper arrow character
+        self.setItemText(-1, "▼")
+        
+    def showPopup(self):
+        """Override to apply dark theme to popup when it appears"""
+        super().showPopup()
+        
+        # Find the view
+        popup = self.findChild(QFrame)
+        if popup:
+            # Apply style to ensure the background is dark
+            popup.setStyleSheet("""
+                background-color: #424242;
+                color: white;
+                border: 1px solid #666666;
+                border-radius: 5px;
+            """)
+            
+        # Additional styling for the popup window
+        view = self.view()
+        if view and view.window():
+            view.window().setStyleSheet("""
+                background-color: #424242;
+                border: 1px solid #666666;
+            """)
 
 class ModernLabel(QLabel):
     def __init__(self, text="", parent=None):
