@@ -59,28 +59,71 @@ class FaceRecognition:
                     # Convert list to dictionary for easier access
                     metadata_dict = {}
                     for person in data:
-                        if isinstance(person, dict) and 'name' in person and 'photos' in person:
-                            metadata_dict[person['name']] = person
-                    print(f"Loaded metadata for {len(metadata_dict)} persons")
+                        if isinstance(person, dict) and 'name' in person:
+                            name = person['name']
+                            metadata_dict[name] = person
+                            
+                            # Ensure features field exists - convert from photos if needed
+                            if 'features' not in person:
+                                if 'photos' in person:
+                                    # Copy photos field to features for backward compatibility
+                                    person['features'] = person['photos'].copy()
+                                    print(f"Copied {len(person['photos'])} photos to features for {name}")
+                                else:
+                                    # Initialize empty features list
+                                    person['features'] = []
+                    
+                    # Debug output after loading
+                    for name, person_data in metadata_dict.items():
+                        if 'features' in person_data:
+                            print(f"📂 LOADED metadata for {name} with {len(person_data['features'])} features: {person_data['features']}")
+                    
+                    print(f"✅ Loaded metadata for {len(metadata_dict)} persons")
                     return metadata_dict
         except Exception as e:
-            print(f"Error loading metadata: {e}")
+            print(f"❌ Error loading metadata: {e}")
+            import traceback
+            traceback.print_exc()  # Print full stack trace
+        
         return {}
 
     def _save_metadata(self):
         """Save metadata about registered faces"""
         try:
-            # Convert dictionary back to list for saving
+            print(self.metadata)
+            # Before saving, ensure all fields are properly structured
+            for name, person_data in self.metadata.items():
+                if 'name' not in person_data:
+                    person_data['name'] = name
+                    
+                # Convert any 'photos' to 'features' for consistency
+                if 'photos' in person_data and 'features' not in person_data:
+                    person_data['features'] = person_data['photos']
+                elif 'features' not in person_data:
+                    person_data['features'] = []
+            
+            # Debug output before saving
+            for name, person_data in self.metadata.items():
+                if 'features' in person_data:
+                    print(f"💾 SAVING metadata for {name} with {len(person_data['features'])} features: {person_data['features']}")
+            
+            # Convert dictionary to list for saving
             metadata_list = list(self.metadata.values())
+            
             # Ensure directory exists
             os.makedirs(os.path.dirname(self.metadata_file), exist_ok=True)
+            
+            # Write directly to the file
             with open(self.metadata_file, 'w') as f:
                 json.dump(metadata_list, f, indent=4)
                 f.flush()  # Force flush to disk
                 os.fsync(f.fileno())  # Ensure it's written to disk
-            print(f"Saved metadata for {len(metadata_list)} persons")
+            
+            print(f"✅ Saved metadata for {len(metadata_list)} persons")
         except Exception as e:
-            print(f"Error saving metadata: {e}")
+            print(f"❌ Error saving metadata: {e}")
+            import traceback
+            traceback.print_exc()  # Print full stack trace
 
     def _detect_face(self, gray_image: np.ndarray) -> List[Tuple[int, int, int, int]]:
         """Wrapper function for face detection with specific parameters"""
@@ -91,48 +134,26 @@ class FaceRecognition:
             minSize=(30, 30)
         )
 
-    async def _process_face(self, image_path: str, name: str, current_label: int) -> Optional[Tuple[np.ndarray, int, str]]:
-        """Process a single face image asynchronously"""
-        if not os.path.exists(image_path):
-            print(f"Image not found: {image_path}")
+    async def _process_face(self, feature_path: str, name: str, current_label: int) -> Optional[Tuple[np.ndarray, int, str]]:
+        """Process a single face feature file asynchronously"""
+        if not os.path.exists(feature_path):
+            print(f"Feature file not found: {feature_path}")
             return None
             
         # Run CPU-intensive tasks in thread pool
         loop = asyncio.get_event_loop()
-        image = await loop.run_in_executor(self.thread_pool, cv2.imread, image_path)
-        if image is None:
-            print(f"Failed to read image: {image_path}")
-            return None
-            
-        # Convert to grayscale
-        gray = await loop.run_in_executor(self.thread_pool, cv2.cvtColor, image, cv2.COLOR_BGR2GRAY)
-        
-        # Equalize histogram for better face detection
-        gray = await loop.run_in_executor(self.thread_pool, cv2.equalizeHist, gray)
-        
-        # Detect face using wrapper function
-        face_locations = await loop.run_in_executor(
-            self.thread_pool,
-            self._detect_face,
-            gray
-        )
-        
-        if len(face_locations) > 0:
-            x, y, w, h = face_locations[0]
-            face = gray[y:y+h, x:x+w]
-            
-            # Resize face to standard size for better recognition
-            face = await loop.run_in_executor(
+        try:
+            # Load the feature vector directly from .npy file
+            face_features = await loop.run_in_executor(
                 self.thread_pool,
-                cv2.resize,
-                face,
-                (100, 100)
+                np.load,
+                feature_path
             )
             
-            return face, current_label, name
-        else:
-            print(f"No face detected in: {image_path}")
-        return None
+            return face_features, current_label, name
+        except Exception as e:
+            print(f"Failed to load feature file: {feature_path}, error: {e}")
+            return None
 
     async def _train_recognizer(self, faces: List[np.ndarray], labels: List[int], label_dict: Dict[int, str]):
         """Train the face recognizer with given faces and labels"""
@@ -168,7 +189,7 @@ class FaceRecognition:
         print(f"Known face names: {self.known_face_names}")
 
     async def _load_database(self):
-        """Load all face encodings from the database directory asynchronously"""
+        """Load all face feature vectors from the database directory asynchronously"""
         if self.is_loading:
             print("Database loading already in progress")
             return
@@ -190,10 +211,10 @@ class FaceRecognition:
             # Process all faces in the database
             for name, person_data in fresh_metadata.items():
                 print(f"Processing person: {name}")
-                for photo in person_data['photos']:
-                    image_path = os.path.join(self.faces_dir, name, photo)
-                    print(f"Processing photo: {image_path}")
-                    result = await self._process_face(image_path, name, current_label)
+                for feature_file in person_data['features']:
+                    feature_path = os.path.join(self.faces_dir, name, feature_file)
+                    print(f"Processing feature file: {feature_path}")
+                    result = await self._process_face(feature_path, name, current_label)
                     if result is not None:
                         face, label, name = result
                         faces.append(face)
@@ -205,7 +226,7 @@ class FaceRecognition:
             # Train with collected faces
             if faces:
                 await self._train_recognizer(faces, labels, label_dict)
-                self.metadata = fresh_metadata.copy()
+                # self.metadata = fresh_metadata.copy()
                 print(f"Database loading completed with {len(faces)} faces")
             else:
                 print("No faces were successfully processed")
@@ -334,67 +355,297 @@ class FaceRecognition:
             print(f"Error processing face: {e}")
         return None
 
+    async def _extract_face_features(self, face: np.ndarray) -> np.ndarray:
+        """Extract features from a face image"""
+        # The LBPH face recognizer already extracts features internally
+        # This method is added for extensibility in the future
+        # For now, we just return the preprocessed face image
+        return await self._preprocess_face(face)
+
     def add_face(self, image: np.ndarray, name: str, angle: str) -> bool:
-        """Add a new face photo to the database"""
+        """Add a new face feature vector to the database but don't save to metadata yet"""
         try:
             # Find the next available ID for this person
             next_id = 0
-            if name in self.metadata and 'photos' in self.metadata[name]:
-                existing_photos = self.metadata[name]['photos']
-                # Find max ID by parsing existing filenames
-                for photo in existing_photos:
+            
+            # Ensure person directory exists
+            person_dir = os.path.join(self.faces_dir, name)
+            os.makedirs(person_dir, exist_ok=True)
+            
+            # Use set to store features to automatically prevent duplicates
+            features_set = set()
+            
+            # Add existing features to set
+            if name in self.metadata and 'features' in self.metadata[name]:
+                existing_features = self.metadata[name]['features']
+                features_set.update(existing_features)
+                print(f"📊 Added {len(existing_features)} existing features to set")
+                
+                # Find max ID by parsing existing filenames in metadata
+                for feature_file in existing_features:
                     try:
-                        # Extract ID from filename format name_ID.jpg
-                        photo_id = int(photo.split('_')[1].split('.')[0])
-                        next_id = max(next_id, photo_id + 1)
+                        # Extract ID from filename format name_ID.npy
+                        feature_id = int(feature_file.split('_')[1].split('.')[0])
+                        next_id = max(next_id, feature_id + 1)
                     except (IndexError, ValueError):
                         # Skip files with non-standard naming
                         pass
             
-            # Generate filename with sequential ID
-            filename = f"{name}_{next_id}.jpg"
-            image_path = os.path.join(self.faces_dir, name, filename)
-            os.makedirs(os.path.dirname(image_path), exist_ok=True)
+            # Also check actual files in the directory
+            if os.path.exists(person_dir):
+                dir_files = os.listdir(person_dir)
+                for filename in dir_files:
+                    if filename.endswith('.npy') and filename.startswith(f"{name}_"):
+                        # Add file to set if not already there
+                        features_set.add(filename)
+                        
+                        try:
+                            # Extract ID from filename format name_ID.npy
+                            feature_id = int(filename.split('_')[1].split('.')[0])
+                            next_id = max(next_id, feature_id + 1)
+                        except (IndexError, ValueError):
+                            # Skip files with non-standard naming
+                            pass
             
-            # Save the image with flush
-            with open(image_path, 'wb') as f:
-                cv2.imwrite(image_path, image)
-                f.flush()
-                os.fsync(f.fileno())
-            print(f"Saved new face image: {image_path}")
+            print(f"📊 Using next ID: {next_id} for person {name}")
             
-            # Update metadata
+            # Generate filename with sequential ID for feature vector
+            feature_filename = f"{name}_{next_id}.npy"
+            feature_path = os.path.join(self.faces_dir, name, feature_filename)
+            
+            # Convert image to grayscale
+            gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+            
+            # Detect face
+            faces = self._detect_face(gray)
+            if len(faces) == 0:
+                print("No face detected in the image")
+                return False
+                
+            # Extract the face from the image
+            x, y, w, h = faces[0]
+            face = gray[y:y+h, x:x+w]
+            
+            # Resize face to standard size
+            face = cv2.resize(face, (100, 100))
+            
+            # Preprocess the face directly instead of using async method
+            # This avoids event loop issues
+            face_features = cv2.equalizeHist(face)
+            
+            # Save the feature vector to disk
+            np.save(feature_path, face_features)
+            print(f"✅ Saved new face feature vector: {feature_path}")
+            
+            # Add new feature to set
+            features_set.add(feature_filename)
+            print(f"📊 Added new feature {feature_filename} to set. Total features: {len(features_set)}")
+            
+            # Update metadata in memory only, but don't save to disk yet
             if name not in self.metadata:
-                self.metadata[name] = {'name': name, 'photos': []}
-            if filename not in self.metadata[name]['photos']:
-                self.metadata[name]['photos'].append(filename)
-            self._save_metadata()
-            print(f"Updated metadata for {name}")
+                # Create a new entry if person doesn't exist
+                self.metadata[name] = {'name': name, 'features': []}
+                print(f"Created new metadata entry for {name}")
+            else:
+                # Ensure features list exists if not
+                if 'features' not in self.metadata[name]:
+                    if 'photos' in self.metadata[name]:
+                        # Backward compatibility - copy photos to features
+                        self.metadata[name]['features'] = self.metadata[name]['photos'].copy()
+                        print(f"Copied {len(self.metadata[name]['photos'])} photos to features for backward compatibility")
+                    else:
+                        self.metadata[name]['features'] = []
+                        print(f"Created new features list for {name}")
             
-            # Reload metadata to ensure we have the latest state
-            self.metadata = self._load_metadata()
-            print("Reloaded metadata with new user")
+            # Update in-memory metadata but don't save to disk yet
+            # Save only the list of features in memory for now
+            self.metadata[name]['features'] = list(features_set)
+            print(f"📊 Updated in-memory metadata with {len(features_set)} features")
             
-            # Always start retraining process immediately - force it to happen
-            # Create a task and return the result immediately - retraining will happen asynchronously
-            create_task(self._retrain_model())
-            print("Started model retraining after adding new face")
+            # Return the filename of the newly added feature for later confirmation
+            return feature_filename
+        except Exception as e:
+            print(f"Error adding face: {e}")
+            import traceback
+            traceback.print_exc()  # Print full stack trace
+            return False
+            
+    def finalize_face_addition(self, name: str, feature_filename: str) -> bool:
+        """Save metadata to disk after face is confirmed (OK button pressed)"""
+        try:
+            # Verify that the feature was actually added to memory
+            if (name not in self.metadata or 
+                'features' not in self.metadata[name] or 
+                feature_filename not in self.metadata[name]['features']):
+                print(f"⚠️ Feature {feature_filename} not found in memory for {name}")
+                return False
+            
+            # Check if this is a new user (only one feature) or an existing user with additional photos
+            # If there's only one feature, this is likely a new user being added for the first time
+            is_new_user = len(self.metadata[name]['features']) == 1
+                
+            # Only save metadata to disk if this is a new user
+            if is_new_user:
+                print(f"💾 Saving metadata to disk for new user {name}")
+                self._save_metadata()
+                print(f"✅ Metadata saved successfully for new user {name}")
+            else:
+                print(f"ℹ️ Skip saving metadata for existing user {name}")
+            
+            # Start retraining process
+            try:
+                print("Starting synchronous retraining...")
+                # Use a direct synchronous approach to force immediate retraining
+                # Pass save_metadata=True for new users to ensure metadata is saved after training
+                self._sync_retrain_model(save_metadata=is_new_user)
+                print("Completed model retraining after adding new face")
+            except Exception as e:
+                print(f"Error during synchronous retraining: {e}")
+                # Fall back to async approach if sync fails
+                try:
+                    print("Falling back to async retraining...")
+                    self.loading_task = asyncio.ensure_future(self._retrain_model(save_metadata=True))
+                except Exception as inner_e:
+                    print(f"Failed to create async retraining task: {inner_e}")
             
             return True
         except Exception as e:
-            print(f"Error adding face: {e}")
+            print(f"Error finalizing face addition: {e}")
+            import traceback
+            traceback.print_exc()  # Print full stack trace
             return False
+            
+    def _sync_retrain_model(self, save_metadata=False):
+        """Synchronous version of retraining to ensure it completes immediately"""
+        if not self.metadata:
+            print("No metadata available for retraining")
+            return
+            
+        print("Starting synchronous model retraining...")
+        
+        try:
+            # Manually perform the steps from _load_database in a synchronous way
+            faces = []
+            labels = []
+            label_dict = {}
+            current_label = 0
+            
+            # Process all faces in the database
+            for name, person_data in self.metadata.items():
+                print(f"Processing person: {name}")
+                if 'features' in person_data and len(person_data['features']) > 0:
+                    features_list = person_data['features']
+                    print(f"Found {len(features_list)} features for person {name}")
+                    
+                    # Assign a unique label for this person (not each photo)
+                    person_label = current_label
+                    current_label += 1
+                    label_dict[person_label] = name
+                    
+                    for feature_file in features_list:
+                        feature_path = os.path.join(self.faces_dir, name, feature_file)
+                        print(f"Processing feature file: {feature_path}")
+                        
+                        if os.path.exists(feature_path):
+                            try:
+                                # Load feature directly
+                                face_features = np.load(feature_path)
+                                faces.append(face_features)
+                                # Use the same label for all features of the same person
+                                labels.append(person_label)
+                                print(f"Added face for {name} with label {person_label}")
+                            except Exception as e:
+                                print(f"Error loading feature file {feature_path}: {e}")
+                else:
+                    print(f"No features found for person: {name}")
+            
+            # If we have faces, train the model
+            if faces:
+                faces_array = np.array(faces)
+                labels_array = np.array(labels)
+                
+                print(f"Training recognizer with {len(faces)} faces")
+                print(f"Faces array shape: {faces_array.shape}")
+                print(f"Labels array shape: {labels_array.shape}")
+                
+                # Debug assertions to detect problems
+                if len(faces_array) != len(labels_array):
+                    print("ERROR: Mismatch between faces and labels array lengths")
+                    return
+                
+                if len(faces_array) == 0:
+                    print("ERROR: No faces to train on")
+                    return
+                
+                # Train directly - this is synchronous
+                self.face_recognizer.train(faces_array, labels_array)
+                print("Face recognizer training completed")
+                
+                # Update all in-memory data structures
+                self.label_dict = label_dict.copy()  # Make a copy to avoid reference issues
+                self.known_face_names = list(set(label_dict.values()))  # Update known face names
+                self.known_face_encodings = faces.copy()  # Update face encodings
+                
+                self.is_trained = True
+                print(f"Training completed with {len(faces)} faces for {len(self.known_face_names)} people")
+                print(f"Label dictionary: {self.label_dict}")
+                print(f"Known face names: {self.known_face_names}")
+                
+                # Only save metadata if explicitly requested (e.g., after new user added)
+                if save_metadata:
+                    print("Saving metadata after retraining as requested...")
+                    self._save_metadata()
+            else:
+                print("No faces were successfully processed")
+                self.is_trained = False
+        except Exception as e:
+            print(f"Error during synchronous model retraining: {e}")
+            import traceback
+            traceback.print_exc()  # Print full stack trace
+            self.is_trained = False
 
     async def add_face_and_wait(self, image: np.ndarray, name: str, angle: str = "") -> bool:
         """Add a new face photo to the database and wait for retraining to complete"""
         try:
+            # Check if this is a new user (not in metadata yet)
+            is_new_user = name not in self.metadata
+            
             # First add the face normally
-            result = self.add_face(image, name, angle)
-            if not result:
+            feature_filename = self.add_face(image, name, angle)
+            if not feature_filename:
                 return False
                 
-            # Then force retraining and wait for it to complete
-            await self._retrain_model()
+            # Finalize the face addition (as if OK was pressed)
+            if not self.finalize_face_addition(name, feature_filename):
+                print(f"Failed to finalize face addition for {name}")
+                return False
+            
+            # Check if we already have a loading task
+            if self.loading_task and not self.loading_task.done():
+                print("Waiting for existing retraining task to complete...")
+                try:
+                    # Wait for the existing task
+                    await self.loading_task
+                    print("Existing retraining task completed")
+                    
+                    # If this was a new user, make sure metadata is saved
+                    if is_new_user:
+                        self._save_metadata()
+                        print(f"✅ Saved metadata for new user {name} after training completed")
+                    
+                    return True
+                except Exception as e:
+                    print(f"Error waiting for existing task: {e}")
+                
+            # No task was created or it failed - force retraining and wait for it to complete
+            print("Forcing retraining and waiting for it to complete...")
+            await self._retrain_model(save_metadata=True)
+            
+            # If this was a new user, make sure metadata is saved
+            if is_new_user:
+                self._save_metadata()
+                print(f"✅ Saved metadata for new user {name} after model retraining")
+                
             print("Model retraining completed after adding new face")
             
             return True
@@ -402,15 +653,26 @@ class FaceRecognition:
             print(f"Error adding face and waiting: {e}")
             return False
 
-    async def _retrain_model(self):
+    async def _retrain_model(self, save_metadata=False):
         """Retrain the model with the current metadata (after a face addition or deletion)"""
         if not self.metadata:
             print("No metadata available for retraining")
             return
             
-        # We'll simply reload the database, which will reconstruct the data and train
-        await self._load_database()
-        print("Model retrained successfully after face modification")
+        print("Starting model retraining...")
+        try:
+            # We'll simply reload the database, which will reconstruct the data and train
+            await self._load_database()
+            
+            # Only save metadata if explicitly requested
+            if save_metadata:
+                print("Saving metadata after retraining as requested...")
+                self._save_metadata()
+                
+            print("Model retrained successfully after face modification")
+        except Exception as e:
+            print(f"Error during model retraining: {e}")
+            self.is_trained = False
 
     def delete_face(self, name: str) -> bool:
         """Delete a face from the database"""
@@ -420,15 +682,11 @@ class FaceRecognition:
                 print(f"Face '{name}' not found in database")
                 return False
                 
-            # Remove from metadata
-            if name in self.metadata:
-                del self.metadata[name]
-                self._save_metadata()
-                
-            # Remove the person's directory
+            # Remove the person's directory from disk
             person_dir = os.path.join(self.faces_dir, name)
             if os.path.exists(person_dir):
                 shutil.rmtree(person_dir)
+                print(f"Removed directory: {person_dir}")
                 
             # Remove from in-memory data
             if name in self.known_face_names:
@@ -441,8 +699,28 @@ class FaceRecognition:
                     new_label_dict[label] = label_name
             self.label_dict = new_label_dict
                 
-            # We need to retrain the model with the remaining faces
-            create_task(self._retrain_model())
+            # Remove from metadata
+            if name in self.metadata:
+                del self.metadata[name]
+                
+            # Save the updated metadata - we must do this for deletions
+            self._save_metadata()
+            print(f"✅ Removed {name} from metadata")
+                
+            # Start retraining process with the remaining faces
+            try:
+                print("Starting synchronous retraining after deletion...")
+                # Use a direct synchronous approach to force immediate retraining
+                self._sync_retrain_model()
+                print("Completed model retraining after face deletion")
+            except Exception as e:
+                print(f"Error during synchronous retraining: {e}")
+                # Fall back to async approach if sync fails
+                try:
+                    print("Falling back to async retraining...")
+                    self.loading_task = asyncio.ensure_future(self._retrain_model(save_metadata=True))
+                except Exception as inner_e:
+                    print(f"Failed to create async retraining task: {inner_e}")
                 
             print(f"Face '{name}' successfully deleted")
             return True
@@ -452,14 +730,22 @@ class FaceRecognition:
 
     def get_photos_count(self, name: str) -> int:
         """Get the number of registered photos for a person"""
-        if name in self.metadata and 'photos' in self.metadata[name]:
-            return len(self.metadata[name]['photos'])
+        if name in self.metadata:
+            if 'features' in self.metadata[name]:
+                return len(self.metadata[name]['features'])
+            elif 'photos' in self.metadata[name]:
+                # Backward compatibility
+                return len(self.metadata[name]['photos'])
         return 0
 
     def get_photos_for_person(self, name: str) -> List[str]:
         """Get list of all photo filenames for a person"""
-        if name in self.metadata and 'photos' in self.metadata[name]:
-            return self.metadata[name]['photos']
+        if name in self.metadata:
+            if 'features' in self.metadata[name]:
+                return self.metadata[name]['features']
+            elif 'photos' in self.metadata[name]:
+                # Backward compatibility
+                return self.metadata[name]['photos']
         return []
 
     def cleanup(self):
