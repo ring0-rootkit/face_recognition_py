@@ -5,7 +5,7 @@ import os
 from face_recognition import FaceRecognition
 from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, 
                             QHBoxLayout, QPushButton, QLabel, QLineEdit, 
-                            QFileDialog, QMessageBox, QFrame, QScrollArea, QDialog, QInputDialog)
+                            QFileDialog, QMessageBox, QFrame, QScrollArea, QDialog, QInputDialog, QGridLayout, QComboBox)
 from PyQt6.QtCore import Qt, QThread, pyqtSignal, QTimer
 from PyQt6.QtGui import QImage, QPixmap, QFont, QIcon, QPalette, QColor
 import time
@@ -75,6 +75,42 @@ class ModernLineEdit(QLineEdit):
             }
             QLineEdit:focus {
                 border: 2px solid #2196F3;
+            }
+        """)
+
+class ModernComboBox(QComboBox):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setStyleSheet("""
+            QComboBox {
+                padding: 8px;
+                border: 2px solid #424242;
+                border-radius: 5px;
+                background-color: #424242;
+                color: white;
+                font-size: 14px;
+                min-height: 20px;
+            }
+            QComboBox:hover {
+                border: 2px solid #2196F3;
+            }
+            QComboBox::drop-down {
+                subcontrol-origin: padding;
+                subcontrol-position: top right;
+                width: 25px;
+                border-left-width: 1px;
+                border-left-color: #424242;
+                border-left-style: solid;
+            }
+            QComboBox::down-arrow {
+                image: url(down_arrow.png);
+            }
+            QComboBox QAbstractItemView {
+                background-color: #424242;
+                color: white;
+                selection-background-color: #2196F3;
+                selection-color: white;
+                border: none;
             }
         """)
 
@@ -330,8 +366,20 @@ class RecognitionPopupDialog(QDialog):
         scaled_pixmap = pixmap.scaled(200, 200, Qt.AspectRatioMode.KeepAspectRatio)
         self.face_label.setPixmap(scaled_pixmap)
         
-        # Info text
-        info_text = ModernLabel(f"Name: {name}\nConfidence: {100 - confidence:.1f}%")
+        # Convert confidence to percentage (higher is better)
+        confidence_pct = max(0, min(100, 100 - confidence))
+        
+        # Info text with colorized confidence
+        confidence_html = f"<span style='color:"
+        if confidence_pct >= 90:
+            confidence_html += "#00FF00'>Excellent Match"  # Green
+        elif confidence_pct >= 75:
+            confidence_html += "#FFFF00'>Good Match"  # Yellow
+        else:
+            confidence_html += "#FFA500'>Low Confidence Match"  # Orange
+        confidence_html += f" ({confidence_pct:.1f}%)</span>"
+        
+        info_text = ModernLabel(f"<html><body><h2>{name}</h2>{confidence_html}</body></html>")
         info_text.setAlignment(Qt.AlignmentFlag.AlignCenter)
         info_text.setStyleSheet("""
             QLabel {
@@ -355,6 +403,27 @@ class FaceRecognitionGUI(QMainWindow):
         self.detection_counter = 0
         self.setWindowTitle("Face Recognition System")
         self.setMinimumSize(1400, 800)
+        
+        # Initialize variables for face detection
+        self.last_recognized_faces = []
+        self.last_detected_faces = []
+        self.is_locked = False
+        self.locked_face = None
+        self.locked_name = None
+        self.locked_confidence = None
+        self.is_scanning = True
+        self.active_dialogs = 0
+        self.current_image = None
+        
+        # Ensure faces directory exists
+        faces_dir = Path("faces/faces")
+        faces_dir.mkdir(parents=True, exist_ok=True)
+        
+        # Ensure metadata.json exists
+        metadata_path = Path("faces/metadata.json")
+        if not metadata_path.exists():
+            with open(metadata_path, 'w') as f:
+                json.dump([], f)
         
         # Initialize face recognition
         self.face_recognizer = FaceRecognition("faces/")
@@ -426,27 +495,48 @@ class FaceRecognitionGUI(QMainWindow):
         middle_layout.addLayout(name_layout)
         
         # Action buttons
+        # Create buttons first
         self.add_button = ModernButton("Add Face")
         self.add_button.clicked.connect(self.add_face)
-        self.recognize_button = ModernButton("Recognize Face")
-        self.recognize_button.clicked.connect(self.recognize_face)
         self.delete_button = ModernButton("Delete Face")
         self.delete_button.clicked.connect(self.delete_face)
         
-        # Add lock button
+        # Create the person selection dropdown
+        people_layout = QHBoxLayout()
+        people_label = ModernLabel("Person:")
+        self.people_combo = ModernComboBox()
+        # self.update_people_combo()  # Populate the combo box - удалено, т.к. вызывается преждевременно
+        people_layout.addWidget(people_label)
+        people_layout.addWidget(self.people_combo)
+        middle_layout.addLayout(people_layout)
+        
+        # Lock button
         self.lock_button = ModernButton("Lock Recognition")
         self.lock_button.setCheckable(True)
         self.lock_button.clicked.connect(self.toggle_lock)
-        self.lock_button.setEnabled(False)
         
-        middle_layout.addWidget(self.add_button)
-        middle_layout.addWidget(self.recognize_button)
-        middle_layout.addWidget(self.delete_button)
-        middle_layout.addWidget(self.lock_button)
+        # Create button layouts
+        button_layout = QGridLayout()
+        button_layout.addWidget(self.add_button, 0, 0)
+        button_layout.addWidget(self.delete_button, 0, 1)
+        button_layout.addWidget(self.lock_button, 1, 0, 1, 2)  # Span both columns
+        middle_layout.addLayout(button_layout)
         
         # Right panel (Recognized Faces)
         right_panel = ModernFrame()
         right_layout = QVBoxLayout(right_panel)
+        
+        # Header for recognized faces
+        recognition_header = ModernLabel("Recognized Faces")
+        recognition_header.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        recognition_header.setStyleSheet("""
+            QLabel {
+                font-size: 18px;
+                font-weight: bold;
+                margin-bottom: 10px;
+            }
+        """)
+        right_layout.addWidget(recognition_header)
         
         # Scroll area for recognized faces
         scroll = QScrollArea()
@@ -497,7 +587,6 @@ class FaceRecognitionGUI(QMainWindow):
         main_layout.addWidget(self.status_label)
         
         # Initialize variables
-        self.current_image = None
         self.camera_thread = None
         
         # Add recognition timer
@@ -509,19 +598,6 @@ class FaceRecognitionGUI(QMainWindow):
         self.last_recognition_time = 0
         self.face_detected_time = 0
         self.last_face_detection = 0
-        self.is_scanning = True
-        self.active_dialogs = 0  # Track number of open dialogs
-        
-        # Initialize lock variables
-        self.is_locked = False
-        self.locked_face = None
-        self.locked_name = None
-        self.locked_confidence = None
-        
-        # Initialize face detection variables
-        self.detection_counter = 0
-        self.last_recognized_faces = []  # Store last known recognized faces
-        self.last_detected_faces = []    # Store last known detected faces
         
         # Set dark theme
         self.setStyleSheet("""
@@ -529,6 +605,9 @@ class FaceRecognitionGUI(QMainWindow):
                 background-color: #212121;
             }
         """)
+        
+        # Populate the people combo box at startup
+        self.update_people_combo()
 
     def toggle_camera(self):
         if not self.camera_thread or not self.camera_thread.isRunning():
@@ -580,43 +659,115 @@ class FaceRecognitionGUI(QMainWindow):
         # Create a copy of the image for drawing
         display_image = image.copy()
         
-        # Draw face rectangles if not locked
-        if not self.is_locked:
-            # Update recognition status every 30 frames
-            self.detection_counter += 1
-            if self.detection_counter >= 30:
-                self.detection_counter = 0
-                # Update last known faces
-                self.last_detected_faces = self.face_recognizer.detect_faces(image)
-                # Create task for face recognition
-                async def update_recognition():
-                    self.last_recognized_faces = await self.face_recognizer.recognize_face(image)
-                asyncio.create_task(update_recognition())
+        # Standard face detection and recognition
+        # Update recognition status every 30 frames
+        self.detection_counter += 1
+        if self.detection_counter >= 30:
+            self.detection_counter = 0
+            # Update last known faces
+            self.last_detected_faces = self.face_recognizer.detect_faces(image)
+            # Create task for face recognition
+            async def update_recognition():
+                self.last_recognized_faces = await self.face_recognizer.recognize_face(image)
+                # Note: Lock button is now enabled/disabled in update_people_combo method
+            asyncio.create_task(update_recognition())
+        
+        # Draw rectangles for all detected faces
+        for (x, y, w, h) in self.last_detected_faces:
+            # Check if face is recognized
+            recognized = False
+            name = None
+            confidence = None
+            for result in self.last_recognized_faces:
+                if (x, y, w, h) == result[2]:  # Compare face locations
+                    recognized = True
+                    name = result[0]  # Get name from result
+                    confidence = result[1]  # Get confidence from result
+                    break
             
-            # Draw rectangles for all detected faces
-            for (x, y, w, h) in self.last_detected_faces:
-                # Check if face is recognized
-                recognized = False
-                name = None
-                for result in self.last_recognized_faces:
-                    if (x, y, w, h) == result[2]:  # Compare face locations
-                        recognized = True
-                        name = result[0]  # Get name from result
-                        break
+            # Skip if locked to a specific person and this is not that person
+            if self.is_locked and recognized and name != self.locked_name:
+                # Draw gray rectangle for ignored faces when locked
+                cv2.rectangle(display_image, (x, y), (x+w, y+h), (128, 128, 128), 2)
+                continue
                 
-                if recognized:
-                    # Draw green rectangle for recognized faces
-                    cv2.rectangle(display_image, (x, y), (x+w, y+h), (0, 255, 0), 2)
-                    # Add name above the rectangle
-                    cv2.putText(display_image, name, (x, y-10), 
-                              cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
+            if recognized:
+                # If locked, only process the selected person
+                if self.is_locked and name != self.locked_name:
+                    continue
+                    
+                # Draw green rectangle for recognized faces
+                cv2.rectangle(display_image, (x, y), (x+w, y+h), (0, 255, 0), 2)
+                # Add name and confidence above the rectangle
+                # Convert confidence to percentage (higher is better)
+                # LBPH confidence is 0-100 where lower is better, so we invert it
+                confidence_pct = max(0, min(100, 100 - confidence))  # Clamp between 0-100
+                
+                # Color gradient based on confidence
+                if confidence_pct >= 90:
+                    bg_color = (0, 255, 0)  # Green for high confidence
+                    text_color = (0, 0, 0)  # Black text
+                elif confidence_pct >= 75:
+                    bg_color = (0, 255, 255)  # Yellow for medium confidence
+                    text_color = (0, 0, 0)  # Black text
+                else:
+                    bg_color = (0, 165, 255)  # Orange for low confidence
+                    text_color = (255, 255, 255)  # White text
+                
+                text = f"{name} ({confidence_pct:.1f}%)"
+                
+                # Calculate text size to position it properly
+                font = cv2.FONT_HERSHEY_SIMPLEX
+                font_scale = 0.5
+                thickness = 2
+                (text_width, text_height), baseline = cv2.getTextSize(text, font, font_scale, thickness)
+                
+                # Draw background rectangle for text
+                cv2.rectangle(display_image, 
+                            (x, y - text_height - 10), 
+                            (x + text_width, y - 5), 
+                            bg_color, 
+                            -1)  # -1 fills the rectangle
+                
+                # Add text
+                cv2.putText(display_image, text, 
+                            (x, y - 10), 
+                            font, 
+                            font_scale, 
+                            text_color,
+                            thickness)
+            else:
+                # If locked, don't display unknown faces
+                if self.is_locked:
+                    # Draw gray rectangle for unknown faces when locked
+                    cv2.rectangle(display_image, (x, y), (x+w, y+h), (128, 128, 128), 2)
                 else:
                     # Draw red rectangle for unrecognized faces
                     cv2.rectangle(display_image, (x, y), (x+w, y+h), (0, 0, 255), 2)
-                    # Add "Unknown" text above the rectangle
-                    cv2.putText(display_image, "Unknown", (x, y-10), 
-                              cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 2)
-        
+                    # Add "Unknown" text with background
+                    text = "Unknown"
+                    
+                    # Calculate text size
+                    font = cv2.FONT_HERSHEY_SIMPLEX
+                    font_scale = 0.5
+                    thickness = 2
+                    (text_width, text_height), baseline = cv2.getTextSize(text, font, font_scale, thickness)
+                    
+                    # Draw background rectangle for text
+                    cv2.rectangle(display_image, 
+                                (x, y - text_height - 10), 
+                                (x + text_width, y - 5), 
+                                (0, 0, 255), 
+                                -1)  # -1 fills the rectangle
+                    
+                    # Add text
+                    cv2.putText(display_image, text, 
+                                (x, y - 10), 
+                                font, 
+                                font_scale, 
+                                (255, 255, 255),  # White text
+                                thickness)
+
         # Convert BGR to RGB
         image_rgb = cv2.cvtColor(display_image, cv2.COLOR_BGR2RGB)
         
@@ -704,6 +855,9 @@ class FaceRecognitionGUI(QMainWindow):
             with open(metadata_path, 'w') as f:
                 json.dump(metadata, f, indent=4)
             
+            # Update people in combo box
+            self.update_people_combo()
+            
             QMessageBox.information(self, 'Success', f'Face "{name}" added successfully!')
             self.name_entry.clear()  # Clear the name field after successful registration
         else:
@@ -714,35 +868,6 @@ class FaceRecognitionGUI(QMainWindow):
         # Disconnect camera frame
         self.camera_thread.frame_ready.disconnect(dialog.set_image)
 
-    async def recognize_face(self):
-        if self.current_image is None:
-            QMessageBox.warning(self, "Warning", "Please load or capture an image first")
-            return
-            
-        results = await self.face_recognizer.recognize_face(self.current_image)
-        
-        if not results:
-            QMessageBox.warning(self, "Warning", "No faces detected or confidence too low")
-            return
-            
-        # Process all recognized faces
-        for name, confidence, (x, y, w, h) in results:
-            if confidence <= 75:  # Lower confidence means better match
-                # Extract face region
-                face_img = self.current_image[y:y+h, x:x+w]
-                # Show popup for each recognized face
-                dialog = RecognitionPopupDialog(name, confidence, face_img, self)
-                self.dialog_opened()
-                await qasync.asyncSlot()(dialog.exec)()
-                self.dialog_closed()
-                
-                # Enable lock button for the last recognized face
-                self.lock_button.setEnabled(True)
-                # Store locked face data
-                self.locked_face = face_img
-                self.locked_name = name
-                self.locked_confidence = confidence
-
     def delete_face(self):
         name = self.name_entry.text().strip()
         if not name:
@@ -751,19 +876,117 @@ class FaceRecognitionGUI(QMainWindow):
             
         if self.face_recognizer.delete_face(name):
             self.status_label.setText(f"Face deleted successfully for {name}")
+            
+            # Update people in combo box
+            self.update_people_combo()
+            
+            # If we had this person locked, unlock
+            if self.is_locked and self.locked_name == name:
+                self.lock_button.setChecked(False)
+                self.toggle_lock()
+                
             self.name_entry.clear()
         else:
             QMessageBox.critical(self, "Error", "Face not found")
 
-    def toggle_lock(self):
-        self.is_locked = self.lock_button.isChecked()
-        if not self.is_locked:
-            self.locked_face = None
-            self.locked_name = None
-            self.locked_confidence = None
-            self.lock_button.setEnabled(False)
+    def update_metadata(self):
+        """Update the face recognition system with new metadata"""
+        # Start loading database in background
+        self.loading_task = self.face_recognizer.start_loading_database()
+        
+        # Update the combo box immediately from metadata file
+        self.update_people_combo()
+        
+        # Also schedule another update after the database is fully loaded
+        async def update_combo_after_loading():
+            await self.loading_task
+            self.update_people_combo()
+            
+        asyncio.create_task(update_combo_after_loading())
 
+    async def check_for_faces(self):
+        """Automatically check for faces in the current image (simplified)"""
+        if not self.is_scanning or self.current_image is None or self.active_dialogs > 0:
+            return
+            
+        # Face detection is already handled in display_image, no need for duplicate processing here
+
+    def closeEvent(self, event):
+        self.stop_camera()
+        self.recognition_timer.stop()
+        event.accept()
+
+    def update_people_combo(self):
+        """Update the list of people in the combo box directly from metadata.json"""
+        self.people_combo.clear()
+        
+        # Read names directly from metadata.json
+        metadata_path = Path("faces/metadata.json")
+        if metadata_path.exists():
+            try:
+                with open(metadata_path, 'r') as f:
+                    metadata = json.load(f)
+                
+                # Extract names from metadata
+                names = [person["name"] for person in metadata if "name" in person]
+                
+                # Add all names to the combo box
+                for name in sorted(names):
+                    self.people_combo.addItem(name)
+                
+                # Enable or disable lock button based on available names
+                # Check if lock_button exists before accessing it
+                if hasattr(self, 'lock_button'):
+                    self.lock_button.setEnabled(len(names) > 0)
+            except (json.JSONDecodeError, IOError) as e:
+                print(f"Error reading metadata.json: {e}")
+                self.status_label.setText("Error reading faces database. Please restart the application.")
+        else:
+            # If metadata file doesn't exist, disable lock button
+            if hasattr(self, 'lock_button'):
+                self.lock_button.setEnabled(False)
+
+    def toggle_lock(self):
+        """Toggle lock state for the selected person"""
+        self.is_locked = self.lock_button.isChecked()
+        
+        if self.is_locked:
+            # Get the selected person's name
+            if self.people_combo.count() == 0:
+                QMessageBox.warning(self, "Warning", "No known faces available for locking")
+                self.lock_button.setChecked(False)
+                self.is_locked = False
+                return
+                
+            self.locked_name = self.people_combo.currentText()
+            self.lock_button.setText(f"Unlock Recognition (Locked to {self.locked_name})")
+            
+            # Display a message
+            self.status_label.setText(f"Recognition locked to {self.locked_name}")
+            
+            # Find and display a matching face if available
+            face_found = False
+            for result in self.last_recognized_faces:
+                name, confidence, (x, y, w, h) = result
+                if name == self.locked_name and self.current_image is not None:
+                    self.locked_face = self.current_image[y:y+h, x:x+w]
+                    self.locked_confidence = confidence
+                    self.display_locked_face()
+                    face_found = True
+                    break
+                    
+            # If no matching face was found in the current frame, just display the lock info
+            if not face_found:
+                self.display_locked_info()
+        else:
+            self.lock_button.setText("Lock Recognition")
+            self.status_label.setText("Recognition unlocked")
+            # Clear the locked face area
+            for i in reversed(range(self.recognized_faces_layout.count())):
+                self.recognized_faces_layout.itemAt(i).widget().setParent(None)
+                
     def display_locked_face(self):
+        """Display the locked face in the recognized faces panel"""
         # Clear previous recognized faces
         for i in reversed(range(self.recognized_faces_layout.count())): 
             self.recognized_faces_layout.itemAt(i).widget().setParent(None)
@@ -785,8 +1008,20 @@ class FaceRecognitionGUI(QMainWindow):
         face_label.setPixmap(pixmap.scaled(150, 150, Qt.AspectRatioMode.KeepAspectRatio))
         face_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
         
-        # Create name and confidence label
-        info_label = ModernLabel(f"{self.locked_name}\nConfidence: {100 - self.locked_confidence:.1f}%\n(Locked)")
+        # Calculate confidence percentage (higher is better)
+        confidence_pct = max(0, min(100, 100 - self.locked_confidence))
+        
+        # Create name and confidence label with styling based on confidence
+        confidence_html = f"<span style='color:"
+        if confidence_pct >= 90:
+            confidence_html += "#00FF00'>Excellent Match"  # Green
+        elif confidence_pct >= 75:
+            confidence_html += "#FFFF00'>Good Match"  # Yellow
+        else:
+            confidence_html += "#FFA500'>Low Confidence Match"  # Orange
+        confidence_html += f" ({confidence_pct:.1f}%)</span>"
+        
+        info_label = ModernLabel(f"<html><body><h3>{self.locked_name}</h3>{confidence_html}<br><b>(Locked)</b></body></html>")
         info_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
         info_label.setStyleSheet("""
             QLabel {
@@ -803,44 +1038,32 @@ class FaceRecognitionGUI(QMainWindow):
         
         self.recognized_faces_layout.addWidget(face_frame)
 
-    def update_metadata(self):
-        """Update the face recognition system with new metadata"""
-        # Start loading database in background
-        self.loading_task = self.face_recognizer.start_loading_database()
-
-    async def check_for_faces(self):
-        if not self.is_scanning or self.current_image is None or self.active_dialogs > 0:
-            return
-            
-        current_time = time.time()
-        faces = self.face_recognizer.detect_faces(self.current_image)
+    def display_locked_info(self):
+        """Display just the locked person info without a face image"""
+        # Clear previous recognized faces
+        for i in reversed(range(self.recognized_faces_layout.count())): 
+            self.recognized_faces_layout.itemAt(i).widget().setParent(None)
         
-        if len(faces) > 0:
-            if self.last_face_detection == 0:
-                self.last_face_detection = current_time
-                self.face_detected_time = current_time
-            elif current_time - self.face_detected_time >= 1.0:  # Face detected for 1 second
-                # Try to recognize the faces
-                results = await self.face_recognizer.recognize_face(self.current_image)
-                if results:
-                    # Get the result with highest confidence
-                    best_result = min(results, key=lambda x: x[1])
-                    name, confidence, (x, y, w, h) = best_result
-                    if confidence <= 75:  # Lower confidence means better match
-                        # Enable lock button
-                        self.lock_button.setEnabled(True)
-                        # Store locked face data
-                        self.locked_face = self.current_image[y:y+h, x:x+w]
-                        self.locked_name = name
-                        self.locked_confidence = confidence
-        else:
-            self.last_face_detection = 0
-            self.face_detected_time = 0
-
-    def closeEvent(self, event):
-        self.stop_camera()
-        self.recognition_timer.stop()
-        event.accept()
+        # Create info frame
+        info_frame = ModernFrame()
+        info_layout = QVBoxLayout(info_frame)
+        info_layout.setSpacing(5)
+        
+        # Create info label
+        info_label = ModernLabel(f"<html><body><h3>{self.locked_name}</h3><br><b>(Locked)</b></body></html>")
+        info_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        info_label.setStyleSheet("""
+            QLabel {
+                color: white;
+                font-size: 14px;
+                padding: 10px;
+                background-color: rgba(66, 66, 66, 0.5);
+                border-radius: 5px;
+            }
+        """)
+        
+        info_layout.addWidget(info_label)
+        self.recognized_faces_layout.addWidget(info_frame)
 
 def main():
     app = QApplication(sys.argv)
