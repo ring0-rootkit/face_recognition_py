@@ -352,6 +352,7 @@ class RecognitionPopupDialog(QDialog):
 class FaceRecognitionGUI(QMainWindow):
     def __init__(self):
         super().__init__()
+        self.detection_counter = 0
         self.setWindowTitle("Face Recognition System")
         self.setMinimumSize(1400, 800)
         
@@ -429,9 +430,16 @@ class FaceRecognitionGUI(QMainWindow):
         self.delete_button = ModernButton("Delete Face")
         self.delete_button.clicked.connect(self.delete_face)
         
+        # Add lock button
+        self.lock_button = ModernButton("Lock Recognition")
+        self.lock_button.setCheckable(True)
+        self.lock_button.clicked.connect(self.toggle_lock)
+        self.lock_button.setEnabled(False)
+        
         middle_layout.addWidget(self.add_button)
         middle_layout.addWidget(self.recognize_button)
         middle_layout.addWidget(self.delete_button)
+        middle_layout.addWidget(self.lock_button)
         
         # Right panel (Recognized Faces)
         right_panel = ModernFrame()
@@ -492,7 +500,7 @@ class FaceRecognitionGUI(QMainWindow):
         # Add recognition timer
         self.recognition_timer = QTimer()
         self.recognition_timer.timeout.connect(self.check_for_faces)
-        self.recognition_timer.start(100)  # Check every 100ms
+        self.recognition_timer.start(3000)  # Check every 3000ms
         
         # Initialize recognition variables
         self.last_recognition_time = 0
@@ -500,6 +508,12 @@ class FaceRecognitionGUI(QMainWindow):
         self.last_face_detection = 0
         self.is_scanning = True
         self.active_dialogs = 0  # Track number of open dialogs
+        
+        # Initialize lock variables
+        self.is_locked = False
+        self.locked_face = None
+        self.locked_name = None
+        self.locked_confidence = None
         
         # Set dark theme
         self.setStyleSheet("""
@@ -534,6 +548,9 @@ class FaceRecognitionGUI(QMainWindow):
 
     def update_camera_frame(self, frame):
         self.current_image = frame
+        if self.is_locked and self.locked_face is not None:
+            # Display locked face in the recognized faces panel
+            self.display_locked_face()
         self.display_image(frame)
 
     def load_image(self):
@@ -552,8 +569,28 @@ class FaceRecognitionGUI(QMainWindow):
                 QMessageBox.critical(self, "Error", "Failed to load image")
 
     def display_image(self, image):
+        # Create a copy of the image for drawing
+        display_image = image.copy()
+        self.detection_counter += 1
+        
+        # Draw face rectangles if not locked
+        if self.detection_counter > 30:
+            self.detection_counter = 0
+            faces = self.face_recognizer.detect_faces(image)
+            results = self.face_recognizer.recognize_face(image)
+            recognized_faces = [(x, y, w, h) for _, _, (x, y, w, h) in results]
+            
+            for (x, y, w, h) in faces:
+                # Check if face is recognized
+                if (x, y, w, h) in recognized_faces:
+                    # Draw green rectangle for recognized faces
+                    cv2.rectangle(display_image, (x, y), (x+w, y+h), (0, 255, 0), 2)
+                else:
+                    # Draw red rectangle for unrecognized faces
+                    cv2.rectangle(display_image, (x, y), (x+w, y+h), (0, 0, 255), 2)
+        
         # Convert BGR to RGB
-        image_rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+        image_rgb = cv2.cvtColor(display_image, cv2.COLOR_BGR2RGB)
         
         # Resize image to fit the label
         height, width = image_rgb.shape[:2]
@@ -635,53 +672,29 @@ class FaceRecognitionGUI(QMainWindow):
             
         results = self.face_recognizer.recognize_face(self.current_image)
         
-        # Clear previous recognized faces
-        for i in reversed(range(self.recognized_faces_layout.count())): 
-            self.recognized_faces_layout.itemAt(i).widget().setParent(None)
-        
         if not results:
             QMessageBox.warning(self, "Warning", "No faces detected or confidence too low")
             return
             
-        # Display each recognized face
-        for name, confidence, (x, y, w, h) in results:
-            # Create face frame
-            face_frame = ModernFrame()
-            face_layout = QVBoxLayout(face_frame)
-            face_layout.setSpacing(5)
-            
+        # Get the best match
+        best_result = min(results, key=lambda x: x[1])
+        name, confidence, (x, y, w, h) = best_result
+        
+        if confidence <= 75:  # Lower confidence means better match
             # Extract face region
             face_img = self.current_image[y:y+h, x:x+w]
+            # Show popup
+            dialog = RecognitionPopupDialog(name, confidence, face_img, self)
+            self.dialog_opened()
+            dialog.exec()
+            self.dialog_closed()
             
-            # Convert face image to QPixmap
-            face_rgb = cv2.cvtColor(face_img, cv2.COLOR_BGR2RGB)
-            h, w, ch = face_rgb.shape
-            bytes_per_line = ch * w
-            qt_image = QImage(face_rgb.data, w, h, bytes_per_line, QImage.Format.Format_RGB888)
-            pixmap = QPixmap.fromImage(qt_image)
-            
-            # Create and set face label
-            face_label = ModernLabel()
-            face_label.setPixmap(pixmap.scaled(150, 150, Qt.AspectRatioMode.KeepAspectRatio))
-            face_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-            
-            # Create name and confidence label
-            info_label = ModernLabel(f"{name}\nConfidence: {100 - confidence:.1f}%")
-            info_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-            info_label.setStyleSheet("""
-                QLabel {
-                    color: white;
-                    font-size: 14px;
-                    padding: 5px;
-                    background-color: rgba(66, 66, 66, 0.5);
-                    border-radius: 5px;
-                }
-            """)
-            
-            face_layout.addWidget(face_label)
-            face_layout.addWidget(info_label)
-            
-            self.recognized_faces_layout.addWidget(face_frame)
+            # Enable lock button
+            self.lock_button.setEnabled(True)
+            # Store locked face data
+            self.locked_face = face_img
+            self.locked_name = name
+            self.locked_confidence = confidence
 
     def delete_face(self):
         name = self.name_entry.text().strip()
@@ -694,6 +707,54 @@ class FaceRecognitionGUI(QMainWindow):
             self.name_entry.clear()
         else:
             QMessageBox.critical(self, "Error", "Face not found")
+
+    def toggle_lock(self):
+        self.is_locked = self.lock_button.isChecked()
+        if not self.is_locked:
+            self.locked_face = None
+            self.locked_name = None
+            self.locked_confidence = None
+            self.lock_button.setEnabled(False)
+
+    def display_locked_face(self):
+        # Clear previous recognized faces
+        for i in reversed(range(self.recognized_faces_layout.count())): 
+            self.recognized_faces_layout.itemAt(i).widget().setParent(None)
+        
+        # Create face frame
+        face_frame = ModernFrame()
+        face_layout = QVBoxLayout(face_frame)
+        face_layout.setSpacing(5)
+        
+        # Convert face image to QPixmap
+        face_rgb = cv2.cvtColor(self.locked_face, cv2.COLOR_BGR2RGB)
+        h, w, ch = face_rgb.shape
+        bytes_per_line = ch * w
+        qt_image = QImage(face_rgb.data, w, h, bytes_per_line, QImage.Format.Format_RGB888)
+        pixmap = QPixmap.fromImage(qt_image)
+        
+        # Create and set face label
+        face_label = ModernLabel()
+        face_label.setPixmap(pixmap.scaled(150, 150, Qt.AspectRatioMode.KeepAspectRatio))
+        face_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        
+        # Create name and confidence label
+        info_label = ModernLabel(f"{self.locked_name}\nConfidence: {100 - self.locked_confidence:.1f}%\n(Locked)")
+        info_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        info_label.setStyleSheet("""
+            QLabel {
+                color: white;
+                font-size: 14px;
+                padding: 5px;
+                background-color: rgba(66, 66, 66, 0.5);
+                border-radius: 5px;
+            }
+        """)
+        
+        face_layout.addWidget(face_label)
+        face_layout.addWidget(info_label)
+        
+        self.recognized_faces_layout.addWidget(face_frame)
 
     def check_for_faces(self):
         if not self.is_scanning or self.current_image is None or self.active_dialogs > 0:
@@ -714,16 +775,12 @@ class FaceRecognitionGUI(QMainWindow):
                     best_result = min(results, key=lambda x: x[1])
                     name, confidence, (x, y, w, h) = best_result
                     if confidence <= 75:  # Lower confidence means better match
-                        # Extract face region
-                        face_img = self.current_image[y:y+h, x:x+w]
-                        # Stop scanning
-                        self.is_scanning = False
-                        # Show popup
-                        dialog = RecognitionPopupDialog(name, confidence, face_img, self)
-                        self.dialog_opened()
-                        dialog.exec()
-                        self.dialog_closed()
-                        self.last_recognition_time = current_time
+                        # Enable lock button
+                        self.lock_button.setEnabled(True)
+                        # Store locked face data
+                        self.locked_face = self.current_image[y:y+h, x:x+w]
+                        self.locked_name = name
+                        self.locked_confidence = confidence
         else:
             self.last_face_detection = 0
             self.face_detected_time = 0
