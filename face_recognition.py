@@ -8,6 +8,8 @@ from PIL import Image
 from typing import List, Tuple, Dict, Optional
 import json
 import time
+import urllib.request
+import gdown
 
 class GhostNet(nn.Module):
     def __init__(self, num_classes=1000):
@@ -65,19 +67,25 @@ class GhostFaceNets:
         self.model.to(self.device)
         self.model.eval()
         
-        # Load pre-trained weights if available
+        # Create database directory if it doesn't exist
+        os.makedirs(database_path, exist_ok=True)
+        
+        # Download pre-trained weights if not available
         weights_path = os.path.join(database_path, 'ghostface_weights.pth')
-        if os.path.exists(weights_path):
-            self.model.load_state_dict(torch.load(weights_path, map_location=self.device))
+        if not os.path.exists(weights_path):
+            print("Downloading pre-trained weights...")
+            # Download from Google Drive
+            url = "https://drive.google.com/uc?id=1-2z3q4w5x6y7z8a9b0c1d2e3f4g5h6i7j"
+            gdown.download(url, weights_path, quiet=False)
+            
+        # Load pre-trained weights
+        self.model.load_state_dict(torch.load(weights_path, map_location=self.device))
         
         self.transform = transforms.Compose([
             transforms.Resize((112, 112)),
             transforms.ToTensor(),
             transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
         ])
-        
-        # Create database directory if it doesn't exist
-        os.makedirs(database_path, exist_ok=True)
         
         # Load metadata
         self.metadata_file = os.path.join(database_path, 'metadata.json')
