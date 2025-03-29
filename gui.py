@@ -280,6 +280,7 @@ class FaceRegistrationDialog(QDialog):
         self.required_recognition_time = 5.0  # Seconds of consecutive recognition required
         self.is_recognized = False  # Current recognition state
         self.last_face_location = None  # Track last detected face location
+        self.original_face_location = None  # Original face coordinates in the full image
         
         # Timers
         self.process_timer = QTimer()  # Timer for processing frames
@@ -289,6 +290,9 @@ class FaceRegistrationDialog(QDialog):
         self.photo_timer = QTimer()  # Timer for taking photos
         self.photo_timer.timeout.connect(self.check_take_photo)
         self.photo_timer.setInterval(500)  # Take photos every 500ms
+        
+        # Flag to track if we've shown a completion dialog
+        self.completion_dialog_shown = False
         
     def set_name(self, name):
         """Set the name for the face being registered"""
@@ -310,6 +314,43 @@ class FaceRegistrationDialog(QDialog):
     def set_image(self, image):
         """Set the current camera image"""
         self.current_image = image.copy()
+        
+        # Detect faces immediately to crop image to face area
+        if self.current_image is not None:
+            gray = cv2.cvtColor(self.current_image, cv2.COLOR_BGR2GRAY)
+            faces = self.face_detector.detectMultiScale(
+                gray,
+                scaleFactor=1.1,
+                minNeighbors=5,
+                minSize=(30, 30)
+            )
+            
+            if len(faces) == 1:
+                # Store original face location for taking photos
+                self.original_face_location = faces[0]
+                x, y, w, h = self.original_face_location
+                
+                # Add padding around the face (30%)
+                padding_x = int(w * 0.3)
+                padding_y = int(h * 0.3)
+                
+                # Calculate padded coordinates with bounds checking
+                start_x = max(0, x - padding_x)
+                start_y = max(0, y - padding_y)
+                end_x = min(self.current_image.shape[1], x + w + padding_x)
+                end_y = min(self.current_image.shape[0], y + h + padding_y)
+                
+                # Crop image to face area with padding
+                self.display_image_with_rect = self.current_image[start_y:end_y, start_x:end_x].copy()
+                
+                # Calculate the position of the face in the cropped image
+                self.last_face_location = (x - start_x, y - start_y, w, h)
+                
+                # Draw rectangle on the cropped image
+                self.display_image_with_rect = self.draw_face_rectangle(
+                    self.display_image_with_rect, self.last_face_location, self.is_recognized)
+                    
+                self.display_image()
         
     def draw_face_rectangle(self, image, face_location, is_recognized):
         """Draw rectangle around detected face"""
@@ -400,6 +441,41 @@ class FaceRegistrationDialog(QDialog):
         # Take the photo
         self.take_photo(self.last_face_location)
             
+    def take_photo(self, face_location):
+        """Take a photo of the detected face and retrain"""
+        x, y, w, h = face_location
+            
+        # If we're using a cropped image in display_image_with_rect, we need to extract
+        # the face from the original current_image using the original coordinates
+        if hasattr(self, 'original_face_location') and self.original_face_location is not None:
+            # Use original coordinates
+            x, y, w, h = self.original_face_location
+            face_img = self.current_image[y:y+h, x:x+w]
+        else:
+            # Extract face region from whatever image we have
+            if self.display_image_with_rect is not None and self.display_image_with_rect.size > 0:
+                # If we have a cropped display image, use that
+                face_img = self.display_image_with_rect[y:y+h, x:x+w]
+            else:
+                # Otherwise use the full image
+                face_img = self.current_image[y:y+h, x:x+w]
+        
+        # Create a task to add the face and wait for retraining
+        async def add_face_and_retrain():
+            # Add the face and wait for retraining to complete
+            await self.parent().face_recognizer.add_face_and_wait(face_img, self.name)
+            # Update UI after retraining is complete
+            self.update_progress()
+            
+        # Start the task
+        create_task(add_face_and_retrain())
+        
+        # Increment counter
+        self.taken_photos += 1
+        
+        # Update progress label
+        self.update_progress()
+    
     def process_current_frame(self):
         """Process the current frame to detect faces and check recognition"""
         if self.current_image is None:
@@ -416,14 +492,45 @@ class FaceRegistrationDialog(QDialog):
             minSize=(30, 30)
         )
         
-        # Create a copy of current image for drawing
-        self.display_image_with_rect = self.current_image.copy()
-        
+        # Process face detection for display
+        if len(faces) == 1:
+            x, y, w, h = faces[0]
+            
+            # Store original face location for taking photos
+            self.original_face_location = faces[0]
+            
+            # Add padding around the face (30%)
+            padding_x = int(w * 0.3)
+            padding_y = int(h * 0.3)
+            
+            # Calculate padded coordinates with bounds checking
+            start_x = max(0, x - padding_x)
+            start_y = max(0, y - padding_y)
+            end_x = min(self.current_image.shape[1], x + w + padding_x)
+            end_y = min(self.current_image.shape[0], y + h + padding_y)
+            
+            # Crop image to face area with padding
+            cropped_image = self.current_image[start_y:end_y, start_x:end_x].copy()
+            
+            # Calculate position of face in cropped image
+            face_x = x - start_x
+            face_y = y - start_y
+            
+            # Update face location for the cropped image
+            self.last_face_location = (face_x, face_y, w, h)
+            
+            # Draw rectangle on cropped image
+            self.display_image_with_rect = cropped_image.copy()
+        else:
+            # If no face or multiple faces, display full image
+            self.display_image_with_rect = self.current_image.copy()
+            self.last_face_location = None
+            self.original_face_location = None
+            
         if len(faces) == 0:
             # No faces detected
             self.is_recognized = False
             self.green_start_time = 0
-            self.last_face_location = None
             self.instructions.setText("No face detected. Please position your face in front of the camera.")
             self.display_image()
             return
@@ -432,16 +539,11 @@ class FaceRegistrationDialog(QDialog):
             # Multiple faces detected
             self.is_recognized = False
             self.green_start_time = 0
-            self.last_face_location = None
             self.instructions.setText("Multiple faces detected. Please ensure only one face is visible.")
             self.display_image()
             return
             
-        # We have exactly one face
-        self.last_face_location = faces[0]
-        x, y, w, h = self.last_face_location
-        
-        # Check if the recognizer is trained and can recognize the face
+        # We have exactly one face - use the original face location for recognition
         if hasattr(self.parent(), 'face_recognizer') and self.taken_photos >= 3:
             face_recognizer = self.parent().face_recognizer
             if face_recognizer.is_trained:
@@ -471,7 +573,10 @@ class FaceRegistrationDialog(QDialog):
                             self.process_timer.stop()
                             self.photo_timer.stop()
                             
-                            # Show success message
+                            # Set flag to indicate completion dialog has been shown
+                            self.completion_dialog_shown = True
+                            
+                            # Show success message and accept the dialog (close it)
                             QMessageBox.information(self, "Registration Complete", 
                                                   f"Face for {self.name} has been successfully registered!")
                             self.accept()
@@ -481,10 +586,11 @@ class FaceRegistrationDialog(QDialog):
                         self.is_recognized = False
                         self.green_start_time = 0
                     
-                    # Draw rectangle with current recognition state
-                    self.display_image_with_rect = self.draw_face_rectangle(
-                        self.current_image, self.last_face_location, self.is_recognized)
-                    self.display_image()
+                    # Draw rectangle with recognition state on the cropped image
+                    if self.display_image_with_rect is not None and self.last_face_location is not None:
+                        self.display_image_with_rect = self.draw_face_rectangle(
+                            self.display_image_with_rect, self.last_face_location, self.is_recognized)
+                        self.display_image()
                     
                     # Update UI
                     self.update_progress()
@@ -493,38 +599,17 @@ class FaceRegistrationDialog(QDialog):
             else:
                 # Recognizer not trained yet
                 self.is_recognized = False
-                self.display_image_with_rect = self.draw_face_rectangle(
-                    self.current_image, self.last_face_location, False)
-                self.display_image()
+                if self.display_image_with_rect is not None and self.last_face_location is not None:
+                    self.display_image_with_rect = self.draw_face_rectangle(
+                        self.display_image_with_rect, self.last_face_location, False)
+                    self.display_image()
         else:
             # Not enough photos yet or no recognizer
             self.is_recognized = False
-            self.display_image_with_rect = self.draw_face_rectangle(
-                self.current_image, self.last_face_location, False)
-            self.display_image()
-    
-    def take_photo(self, face_location):
-        """Take a photo of the detected face and retrain"""
-        x, y, w, h = face_location
-            
-        # Extract face region
-        face_img = self.current_image[y:y+h, x:x+w]
-        
-        # Create a task to add the face and wait for retraining
-        async def add_face_and_retrain():
-            # Add the face and wait for retraining to complete
-            await self.parent().face_recognizer.add_face_and_wait(face_img, self.name)
-            # Update UI after retraining is complete
-            self.update_progress()
-            
-        # Start the task
-        create_task(add_face_and_retrain())
-        
-        # Increment counter
-        self.taken_photos += 1
-        
-        # Update progress label
-        self.update_progress()
+            if self.display_image_with_rect is not None and self.last_face_location is not None:
+                self.display_image_with_rect = self.draw_face_rectangle(
+                    self.display_image_with_rect, self.last_face_location, False)
+                self.display_image()
     
     def retrain_recognizer(self):
         """Retrain the face recognizer with the new photos"""
@@ -820,7 +905,7 @@ class FaceRecognitionGUI(QMainWindow):
         # Add recognition timer (using regular method, not async)
         self.recognition_timer = QTimer()
         self.recognition_timer.timeout.connect(self.check_for_faces)
-        self.recognition_timer.start(3000)  # Check every 3000ms
+        self.recognition_timer.start(500)  # Check every 3000ms
         
         # Initialize recognition variables
         self.last_recognition_time = 0
@@ -953,43 +1038,35 @@ class FaceRecognitionGUI(QMainWindow):
                 # Note: Lock button is now enabled/disabled in update_people_combo method
             create_task(update_recognition())
         
+        # Создаем словарь для быстрого поиска распознанных лиц по координатам
+        recognized_faces_dict = {}
+        for result in self.last_recognized_faces:
+            name, confidence, face_location = result
+            # Используем координаты лица как ключ для быстрого поиска
+            recognized_faces_dict[face_location] = (name, confidence)
+        
         # Draw rectangles for all detected faces
         for (x, y, w, h) in self.last_detected_faces:
-            # Check if face is recognized
-            recognized = False
-            name = None
-            confidence = None
-            confidence_pct = 0  # Инициализация переменной
-            
-            for result in self.last_recognized_faces:
-                if (x, y, w, h) == result[2]:  # Compare face locations
-                    recognized = True
-                    name = result[0]  # Get name from result
-                    confidence = result[1]  # Get confidence from result
-                    
-                    # Convert confidence to percentage (higher is better)
-                    # LBPH confidence is 0-100 where lower is better, so we invert it
-                    confidence_pct = max(0, min(100, 100 - confidence))  # Clamp between 0-100
-                    
-                    # If confidence is less than 10%, treat as unknown
-                    if confidence_pct < 10:
-                        recognized = False
-                        name = None
-                        confidence = None
-                    
-                    break
-            
-            # Skip if locked to a specific person and this is not that person
-            if self.is_locked and recognized and name != self.locked_name:
-                # Draw gray rectangle for ignored faces when locked
-                cv2.rectangle(display_image, (x, y), (x+w, y+h), (128, 128, 128), 2)
-                continue
+            # Проверяем, распознано ли это лицо
+            face_location = (x, y, w, h)
+            if face_location in recognized_faces_dict:
+                # Лицо распознано
+                name, confidence = recognized_faces_dict[face_location]
                 
-            if recognized:
-                # If locked, only process the selected person
-                if self.is_locked and name != self.locked_name:
+                # Convert confidence to percentage (higher is better)
+                confidence_pct = max(0, min(100, 100 - confidence))
+                
+                # If confidence is less than 10%, treat as unknown
+                if confidence_pct < 10:
+                    # Если уверенность слишком низкая, пропускаем кадр чтобы избежать мерцания
                     continue
-                    
+                
+                # Skip if locked to a specific person and this is not that person
+                if self.is_locked and name != self.locked_name:
+                    # Draw gray rectangle for ignored faces when locked
+                    cv2.rectangle(display_image, (x, y), (x+w, y+h), (128, 128, 128), 2)
+                    continue
+                
                 # Draw green rectangle for recognized faces
                 cv2.rectangle(display_image, (x, y), (x+w, y+h), (0, 255, 0), 2)
                 
@@ -1027,36 +1104,112 @@ class FaceRecognitionGUI(QMainWindow):
                             text_color,
                             thickness)
             else:
-                # If locked, don't display unknown faces
-                if self.is_locked:
-                    # Draw gray rectangle for unknown faces when locked
-                    cv2.rectangle(display_image, (x, y), (x+w, y+h), (128, 128, 128), 2)
-                else:
-                    # Draw red rectangle for unrecognized faces
-                    cv2.rectangle(display_image, (x, y), (x+w, y+h), (0, 0, 255), 2)
-                    # Add "Unknown" text with background
-                    text = "Unknown"
+                # Если лицо не распознано в текущем кадре
+                # Но! Проверим, было ли это лицо распознано недавно в том же месте
+                # Это поможет избежать мигания между "Unknown" и именем
+                
+                # Проверим, есть ли пересечение с любыми недавно распознанными лицами
+                # с приемлемым отклонением (например, 20 пикселей)
+                tolerance = 20
+                found_match = False
+                
+                for result in self.last_recognized_faces:
+                    known_name, known_confidence, (known_x, known_y, known_w, known_h) = result
                     
-                    # Calculate text size
-                    font = cv2.FONT_HERSHEY_SIMPLEX
-                    font_scale = 0.5
-                    thickness = 2
-                    (text_width, text_height), baseline = cv2.getTextSize(text, font, font_scale, thickness)
+                    # Проверяем пересечение областей с учетом допуска
+                    if (abs(known_x - x) < tolerance and 
+                        abs(known_y - y) < tolerance and 
+                        abs(known_w - w) < tolerance and 
+                        abs(known_h - h) < tolerance):
+                            
+                        # Найдено совпадение с недавно распознанным лицом
+                        found_match = True
+                        
+                        # Конвертируем уверенность в проценты
+                        confidence_pct = max(0, min(100, 100 - known_confidence))
+                        
+                        # Пропускаем, если уверенность слишком низкая
+                        if confidence_pct < 10:
+                            found_match = False
+                            break
+                            
+                        # Пропускаем, если заблокированы на конкретном человеке
+                        if self.is_locked and known_name != self.locked_name:
+                            # Draw gray rectangle for ignored faces when locked
+                            cv2.rectangle(display_image, (x, y), (x+w, y+h), (128, 128, 128), 2)
+                            break
+                            
+                        # Draw green rectangle for recognized faces
+                        cv2.rectangle(display_image, (x, y), (x+w, y+h), (0, 255, 0), 2)
+                        
+                        # Color gradient based on confidence
+                        if confidence_pct >= 90:
+                            bg_color = (0, 255, 0)  # Green for high confidence
+                            text_color = (0, 0, 0)  # Black text
+                        elif confidence_pct >= 75:
+                            bg_color = (0, 255, 255)  # Yellow for medium confidence
+                            text_color = (0, 0, 0)  # Black text
+                        else:
+                            bg_color = (0, 165, 255)  # Orange for low confidence
+                            text_color = (255, 255, 255)  # White text
+                        
+                        text = f"{known_name} ({confidence_pct:.1f}%)"
+                        
+                        # Calculate text size to position it properly
+                        font = cv2.FONT_HERSHEY_SIMPLEX
+                        font_scale = 0.5
+                        thickness = 2
+                        (text_width, text_height), baseline = cv2.getTextSize(text, font, font_scale, thickness)
+                        
+                        # Draw background rectangle for text
+                        cv2.rectangle(display_image, 
+                                    (x, y - text_height - 10), 
+                                    (x + text_width, y - 5), 
+                                    bg_color, 
+                                    -1)  # -1 fills the rectangle
+                        
+                        # Add text
+                        cv2.putText(display_image, text, 
+                                    (x, y - 10), 
+                                    font, 
+                                    font_scale, 
+                                    text_color,
+                                    thickness)
+                        break
+                
+                if not found_match:
+                    # Если лицо действительно не распознано и не соответствует ни одному недавнему
                     
-                    # Draw background rectangle for text
-                    cv2.rectangle(display_image, 
-                                (x, y - text_height - 10), 
-                                (x + text_width, y - 5), 
-                                (0, 0, 255), 
-                                -1)  # -1 fills the rectangle
-                    
-                    # Add text
-                    cv2.putText(display_image, text, 
-                                (x, y - 10), 
-                                font, 
-                                font_scale, 
-                                (255, 255, 255),  # White text
-                                thickness)
+                    # If locked, don't display unknown faces
+                    if self.is_locked:
+                        # Draw gray rectangle for unknown faces when locked
+                        cv2.rectangle(display_image, (x, y), (x+w, y+h), (128, 128, 128), 2)
+                    else:
+                        # Draw red rectangle for unrecognized faces
+                        cv2.rectangle(display_image, (x, y), (x+w, y+h), (0, 0, 255), 2)
+                        # Add "Unknown" text with background
+                        text = "Unknown"
+                        
+                        # Calculate text size
+                        font = cv2.FONT_HERSHEY_SIMPLEX
+                        font_scale = 0.5
+                        thickness = 2
+                        (text_width, text_height), baseline = cv2.getTextSize(text, font, font_scale, thickness)
+                        
+                        # Draw background rectangle for text
+                        cv2.rectangle(display_image, 
+                                    (x, y - text_height - 10), 
+                                    (x + text_width, y - 5), 
+                                    (0, 0, 255), 
+                                    -1)  # -1 fills the rectangle
+                        
+                        # Add text
+                        cv2.putText(display_image, text, 
+                                    (x, y - 10), 
+                                    font, 
+                                    font_scale, 
+                                    (255, 255, 255),  # White text
+                                    thickness)
 
         # Convert BGR to RGB
         image_rgb = cv2.cvtColor(display_image, cv2.COLOR_BGR2RGB)
@@ -1173,34 +1326,8 @@ class FaceRecognitionGUI(QMainWindow):
             self.camera_thread.frame_ready.connect(dialog.set_image)
             
             if dialog.exec() == QDialog.DialogCode.Accepted:
-                # Update metadata
+                # Update metadata and UI
                 self.update_metadata()
-                
-                # Save metadata to file by scanning faces directory
-                metadata = []
-                faces_dir = Path("faces/faces")
-                if faces_dir.exists():
-                    for person_dir in faces_dir.iterdir():
-                        if person_dir.is_dir():
-                            person_name = person_dir.name
-                            person_photos = []
-                            # Add all photos from person's directory
-                            for photo in person_dir.glob("*.jpg"):
-                                person_photos.append(photo.name)
-                            if person_photos:
-                                metadata.append({
-                                    "name": person_name,
-                                    "photos": person_photos
-                                })
-                
-                # Save metadata to file
-                metadata_path = Path("faces/metadata.json")
-                with open(metadata_path, 'w') as f:
-                    json.dump(metadata, f, indent=4)
-                
-                # Update people in combo box
-                self.update_people_combo()
-                
                 self.status_label.setText(f'Face "{name}" added successfully!')
                 self.name_entry.clear()  # Clear the name field after successful registration
             else:
@@ -1252,6 +1379,28 @@ class FaceRecognitionGUI(QMainWindow):
         """Update the face recognition system with new metadata"""
         # Start loading database in background
         self.loading_task = self.face_recognizer.start_loading_database()
+        
+        # Save metadata to file by scanning faces directory
+        metadata = []
+        faces_dir = Path("faces/faces")
+        if faces_dir.exists():
+            for person_dir in faces_dir.iterdir():
+                if person_dir.is_dir():
+                    person_name = person_dir.name
+                    person_photos = []
+                    # Add all photos from person's directory
+                    for photo in person_dir.glob("*.jpg"):
+                        person_photos.append(photo.name)
+                    if person_photos:
+                        metadata.append({
+                            "name": person_name,
+                            "photos": person_photos
+                        })
+        
+        # Save metadata to file
+        metadata_path = Path("faces/metadata.json")
+        with open(metadata_path, 'w') as f:
+            json.dump(metadata, f, indent=4)
         
         # Update the combo box immediately from metadata file
         self.update_people_combo()

@@ -1,0 +1,3 @@
+ [] store feature vector instead of images
+ [] disable main camera frame on new face addition screen
+ [] use GPU if CPU is currently used in our implementation
