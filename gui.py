@@ -5,10 +5,12 @@ import os
 from face_recognition import FaceRecognition
 from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, 
                             QHBoxLayout, QPushButton, QLabel, QLineEdit, 
-                            QFileDialog, QMessageBox, QFrame, QScrollArea, QDialog)
+                            QFileDialog, QMessageBox, QFrame, QScrollArea, QDialog, QInputDialog)
 from PyQt6.QtCore import Qt, QThread, pyqtSignal, QTimer
 from PyQt6.QtGui import QImage, QPixmap, QFont, QIcon, QPalette, QColor
 import time
+from pathlib import Path
+import json
 
 class CameraThread(QThread):
     frame_ready = pyqtSignal(np.ndarray)
@@ -98,189 +100,184 @@ class FaceRegistrationDialog(QDialog):
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setWindowTitle("Face Registration")
-        self.setMinimumSize(1000, 800)
-        self.setStyleSheet("""
-            QDialog {
-                background-color: #212121;
-            }
-        """)
+        self.setModal(True)
+        self.setMinimumWidth(400)
         
         # Create layout
-        layout = QVBoxLayout(self)
-        layout.setSpacing(20)
+        layout = QVBoxLayout()
         
-        # Title
-        title = ModernLabel("Face Registration")
-        title.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        title.setStyleSheet("""
-            QLabel {
-                color: white;
-                font-size: 24px;
-                font-weight: bold;
-            }
-        """)
+        # Add title
+        title = QLabel("Face Registration")
+        title.setStyleSheet("font-size: 18px; font-weight: bold; margin-bottom: 10px;")
         layout.addWidget(title)
         
-        # Instructions
-        self.instructions = ModernLabel()
-        self.instructions.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        # Add instructions
+        self.instructions = QLabel()
         self.instructions.setWordWrap(True)
-        self.instructions.setStyleSheet("""
-            QLabel {
-                color: white;
-                font-size: 16px;
-                padding: 20px;
-                background-color: rgba(66, 66, 66, 0.5);
-                border-radius: 10px;
-            }
-        """)
+        self.instructions.setStyleSheet("margin-bottom: 10px;")
         layout.addWidget(self.instructions)
         
-        # Create horizontal layout for camera and preview
-        preview_layout = QHBoxLayout()
-        
-        # Camera view
-        self.camera_label = ModernLabel()
-        self.camera_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.camera_label.setMinimumSize(400, 300)
-        self.camera_label.setStyleSheet("""
+        # Add image display
+        self.image_label = QLabel()
+        self.image_label.setMinimumSize(320, 240)
+        self.image_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.image_label.setStyleSheet("""
             QLabel {
-                background-color: #212121;
+                background-color: #2b2b2b;
                 border-radius: 10px;
             }
         """)
-        preview_layout.addWidget(self.camera_label)
+        layout.addWidget(self.image_label)
         
-        # Preview of taken photo
-        self.preview_label = ModernLabel()
-        self.preview_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.preview_label.setMinimumSize(400, 300)
-        self.preview_label.setStyleSheet("""
-            QLabel {
-                background-color: #212121;
-                border-radius: 10px;
-            }
-        """)
-        preview_layout.addWidget(self.preview_label)
-        
-        layout.addLayout(preview_layout)
-        
-        # Buttons
+        # Add buttons
         button_layout = QHBoxLayout()
         
-        self.capture_button = ModernButton("Capture")
-        self.capture_button.clicked.connect(self.capture_photo)
-        self.accept_button = ModernButton("Accept")
+        self.accept_button = QPushButton("Accept")
+        self.accept_button.setStyleSheet("""
+            QPushButton {
+                background-color: #4CAF50;
+                color: white;
+                border: none;
+                padding: 8px 16px;
+                border-radius: 4px;
+                font-weight: bold;
+            }
+            QPushButton:hover {
+                background-color: #45a049;
+            }
+        """)
         self.accept_button.clicked.connect(self.accept_photo)
-        self.accept_button.setEnabled(False)
-        self.redo_button = ModernButton("Redo")
+        
+        self.redo_button = QPushButton("Redo")
+        self.redo_button.setStyleSheet("""
+            QPushButton {
+                background-color: #f44336;
+                color: white;
+                border: none;
+                padding: 8px 16px;
+                border-radius: 4px;
+                font-weight: bold;
+            }
+            QPushButton:hover {
+                background-color: #da190b;
+            }
+        """)
         self.redo_button.clicked.connect(self.redo_photo)
-        self.redo_button.setEnabled(False)
-        self.cancel_button = ModernButton("Cancel")
+        
+        self.cancel_button = QPushButton("Cancel")
+        self.cancel_button.setStyleSheet("""
+            QPushButton {
+                background-color: #9e9e9e;
+                color: white;
+                border: none;
+                padding: 8px 16px;
+                border-radius: 4px;
+                font-weight: bold;
+            }
+            QPushButton:hover {
+                background-color: #757575;
+            }
+        """)
         self.cancel_button.clicked.connect(self.reject)
         
-        button_layout.addWidget(self.capture_button)
-        button_layout.addWidget(self.redo_button)
         button_layout.addWidget(self.accept_button)
+        button_layout.addWidget(self.redo_button)
         button_layout.addWidget(self.cancel_button)
-        
         layout.addLayout(button_layout)
         
-        # Progress
-        self.progress_label = ModernLabel()
+        # Add progress label
+        self.progress_label = QLabel()
         self.progress_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.progress_label.setStyleSheet("margin-top: 10px;")
         layout.addWidget(self.progress_label)
+        
+        self.setLayout(layout)
         
         # Initialize variables
         self.current_step = 0
         self.steps = [
-            ("front", "Please look directly at the camera"),
-            ("left", "Please turn your head slightly to the left"),
-            ("right", "Please turn your head slightly to the right"),
-            ("up", "Please look slightly upward"),
-            ("down", "Please look slightly downward"),
-            ("front2", "Please look directly at the camera again")
+            ("front", "Look directly at the camera"),
+            ("left", "Turn your head slightly to the left"),
+            ("right", "Turn your head slightly to the right"),
+            ("up", "Look slightly upward"),
+            ("down", "Look slightly downward"),
+            ("front2", "Look directly at the camera again")
         ]
         self.current_image = None
-        self.name = ""
-        self.taken_photos = {}
+        self.name = None
         
-        self.update_ui()
-
-    def set_name(self, name: str):
+    def set_name(self, name):
+        """Set the name for the face being registered"""
         self.name = name
         self.update_ui()
-
+        
     def update_ui(self):
+        """Update the UI based on current step"""
         if self.current_step < len(self.steps):
             angle, instruction = self.steps[self.current_step]
             self.instructions.setText(instruction)
             self.progress_label.setText(f"Step {self.current_step + 1} of {len(self.steps)}")
-            
-            # Show preview of taken photo if exists
-            if angle in self.taken_photos:
-                self.display_image(self.taken_photos[angle], self.preview_label)
-            else:
-                self.preview_label.clear()
-        else:
-            self.accept()
-
-    def set_image(self, image):
-        self.current_image = image
-        self.display_image(image, self.camera_label)
-
-    def capture_photo(self):
-        if self.current_image is not None:
-            self.display_image(self.current_image, self.preview_label)
             self.accept_button.setEnabled(True)
             self.redo_button.setEnabled(True)
-            self.capture_button.setEnabled(False)
-
-    def accept_photo(self):
-        if self.current_step < len(self.steps):
-            angle, _ = self.steps[self.current_step]
-            self.taken_photos[angle] = self.current_image.copy()
-            self.parent().face_recognizer.add_face(self.current_image, self.name, angle)
-            self.current_step += 1
-            self.current_image = None
+        else:
+            self.instructions.setText("Registration complete!")
+            self.progress_label.setText("All steps completed")
             self.accept_button.setEnabled(False)
             self.redo_button.setEnabled(False)
-            self.capture_button.setEnabled(True)
+            
+    def set_image(self, image):
+        """Set the current camera image"""
+        self.current_image = image
+        self.display_image()
+        
+    def display_image(self):
+        """Display the current image"""
+        if self.current_image is not None:
+            # Convert to RGB for display
+            rgb_image = cv2.cvtColor(self.current_image, cv2.COLOR_BGR2RGB)
+            h, w, ch = rgb_image.shape
+            bytes_per_line = ch * w
+            
+            # Create QImage
+            qt_image = QImage(rgb_image.data, w, h, bytes_per_line, QImage.Format.Format_RGB888)
+            
+            # Scale image to fit label while maintaining aspect ratio
+            scaled_pixmap = QPixmap.fromImage(qt_image).scaled(
+                self.image_label.size(), 
+                Qt.AspectRatioMode.KeepAspectRatio, 
+                Qt.TransformationMode.SmoothTransformation
+            )
+            
+            self.image_label.setPixmap(scaled_pixmap)
+            
+    def accept_photo(self):
+        """Accept the current photo and move to next step"""
+        if self.current_step < len(self.steps):
+            angle, _ = self.steps[self.current_step]
+            
+            # Save the photo
+            person_dir = Path("faces/faces") / self.name
+            if angle == "front2":
+                # For the second front photo, use a different name
+                filename = f"{self.name}_front2.jpg"
+            else:
+                filename = f"{self.name}_{angle}.jpg"
+            
+            photo_path = person_dir / filename
+            cv2.imwrite(str(photo_path), self.current_image)
+            
+            # Move to next step
+            self.current_step += 1
             self.update_ui()
-
+            
+            # If all steps are complete, accept the dialog
+            if self.current_step >= len(self.steps):
+                self.accept()
+                
     def redo_photo(self):
-        self.current_image = None
-        self.preview_label.clear()
-        self.accept_button.setEnabled(False)
-        self.redo_button.setEnabled(False)
-        self.capture_button.setEnabled(True)
-
-    def display_image(self, image, label):
-        # Convert BGR to RGB
-        image_rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
-        
-        # Resize image to fit the label
-        height, width = image_rgb.shape[:2]
-        label_size = label.size()
-        scale = min(label_size.width() / width, label_size.height() / height)
-        new_width = int(width * scale)
-        new_height = int(height * scale)
-        image_rgb = cv2.resize(image_rgb, (new_width, new_height))
-        
-        # Convert to QImage and QPixmap
-        h, w, ch = image_rgb.shape
-        bytes_per_line = ch * w
-        qt_image = QImage(image_rgb.data, w, h, bytes_per_line, QImage.Format.Format_RGB888)
-        pixmap = QPixmap.fromImage(qt_image)
-        
-        # Scale pixmap to fit label while maintaining aspect ratio
-        scaled_pixmap = pixmap.scaled(
-            label.size(),
-            Qt.AspectRatioMode.KeepAspectRatio,
-            Qt.TransformationMode.SmoothTransformation
-        )
-        
-        label.setPixmap(scaled_pixmap)
+        """Redo the current photo"""
+        # No need to do anything, just wait for next frame
+        pass
 
 class RecognitionPopupDialog(QDialog):
     def __init__(self, name: str, confidence: float, face_image: np.ndarray, parent=None):
@@ -515,6 +512,11 @@ class FaceRecognitionGUI(QMainWindow):
         self.locked_name = None
         self.locked_confidence = None
         
+        # Initialize face detection variables
+        self.detection_counter = 0
+        self.last_recognized_faces = []  # Store last known recognized faces
+        self.last_detected_faces = []    # Store last known detected faces
+        
         # Set dark theme
         self.setStyleSheet("""
             QMainWindow {
@@ -571,18 +573,22 @@ class FaceRecognitionGUI(QMainWindow):
     def display_image(self, image):
         # Create a copy of the image for drawing
         display_image = image.copy()
-        self.detection_counter += 1
         
         # Draw face rectangles if not locked
-        if self.detection_counter > 30:
-            self.detection_counter = 0
-            faces = self.face_recognizer.detect_faces(image)
-            results = self.face_recognizer.recognize_face(image)
-            recognized_faces = [(x, y, w, h) for _, _, (x, y, w, h) in results]
+        if not self.is_locked:
+            # Update recognition status every 30 frames
+            self.detection_counter += 1
+            if self.detection_counter >= 30:
+                self.detection_counter = 0
+                # Update last known faces
+                self.last_detected_faces = self.face_recognizer.detect_faces(image)
+                results = self.face_recognizer.recognize_face(image)
+                self.last_recognized_faces = [(x, y, w, h) for _, _, (x, y, w, h) in results]
             
-            for (x, y, w, h) in faces:
+            # Draw rectangles for all detected faces
+            for (x, y, w, h) in self.last_detected_faces:
                 # Check if face is recognized
-                if (x, y, w, h) in recognized_faces:
+                if (x, y, w, h) in self.last_recognized_faces:
                     # Draw green rectangle for recognized faces
                     cv2.rectangle(display_image, (x, y), (x+w, y+h), (0, 255, 0), 2)
                 else:
@@ -625,45 +631,66 @@ class FaceRecognitionGUI(QMainWindow):
             self.is_scanning = True
 
     def add_face(self):
-        if self.current_image is None:
-            QMessageBox.warning(self, "Warning", "Please load or capture an image first")
-            return
-            
+        """Add a new face to the database"""
         name = self.name_entry.text().strip()
         if not name:
             QMessageBox.warning(self, "Warning", "Please enter a name")
             return
             
-        # Check if face is already registered
-        registered_angles = self.face_recognizer.get_registered_angles(name)
-        if registered_angles:
-            reply = QMessageBox.question(
-                self,
-                "Face Already Registered",
-                f"Face '{name}' is already registered with {len(registered_angles)} photos. Do you want to add more photos?",
-                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
-            )
-            if reply == QMessageBox.StandardButton.No:
+        # Check if face already exists
+        if name in self.face_recognizer.known_face_names:
+            reply = QMessageBox.question(self, 'Face Exists', 
+                f'Face "{name}" already exists. Do you want to add more photos?',
+                QMessageBox.Yes | QMessageBox.No)
+            if reply == QMessageBox.No:
                 return
         
-        # Start registration dialog
+        # Create person directory if it doesn't exist
+        person_dir = Path("faces/faces") / name
+        person_dir.mkdir(parents=True, exist_ok=True)
+        
+        # Create registration dialog
         dialog = FaceRegistrationDialog(self)
         dialog.set_name(name)
         
         # Connect camera frame to dialog
-        if self.camera_thread and self.camera_thread.isRunning():
-            self.camera_thread.frame_ready.connect(dialog.set_image)
-            self.dialog_opened()
-            dialog.exec()
-            self.dialog_closed()
-            self.camera_thread.frame_ready.disconnect(dialog.set_image)
-        else:
-            self.dialog_opened()
-            dialog.set_image(self.current_image)
-            dialog.exec()
-            self.dialog_closed()
+        self.camera_thread.frame_ready.connect(dialog.set_image)
         
-        self.name_entry.clear()
+        if dialog.exec() == QDialog.DialogCode.Accepted:
+            # Update metadata
+            self.update_metadata()
+            
+            # Save metadata to file by scanning faces directory
+            metadata = []
+            faces_dir = Path("faces/faces")
+            if faces_dir.exists():
+                for person_dir in faces_dir.iterdir():
+                    if person_dir.is_dir():
+                        person_name = person_dir.name
+                        person_photos = []
+                        # Add all photos from person's directory
+                        for photo in person_dir.glob("*.jpg"):
+                            person_photos.append(photo.name)
+                        if person_photos:
+                            metadata.append({
+                                "name": person_name,
+                                "photos": person_photos
+                            })
+            
+            # Save metadata to file
+            metadata_path = Path("faces/metadata.json")
+            with open(metadata_path, 'w') as f:
+                json.dump(metadata, f, indent=4)
+            
+            QMessageBox.information(self, 'Success', f'Face "{name}" added successfully!')
+            self.name_entry.clear()  # Clear the name field after successful registration
+        else:
+            # Clean up if cancelled
+            if not any(person_dir.iterdir()):
+                person_dir.rmdir()
+        
+        # Disconnect camera frame
+        self.camera_thread.frame_ready.disconnect(dialog.set_image)
 
     def recognize_face(self):
         if self.current_image is None:
@@ -755,6 +782,11 @@ class FaceRecognitionGUI(QMainWindow):
         face_layout.addWidget(info_label)
         
         self.recognized_faces_layout.addWidget(face_frame)
+
+    def update_metadata(self):
+        """Update the face recognition system with new metadata"""
+        # Reinitialize face recognition with updated metadata
+        self.face_recognizer = FaceRecognition("faces/")
 
     def check_for_faces(self):
         if not self.is_scanning or self.current_image is None or self.active_dialogs > 0:

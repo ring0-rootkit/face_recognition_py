@@ -42,9 +42,10 @@ class FaceRecognition:
         label_dict = {}
         current_label = 0
         
-        for name, data in self.metadata.items():
-            for angle, filename in data['photos'].items():
-                image_path = os.path.join(self.faces_dir, filename)
+        for person in self.metadata:
+            name = person['name']
+            for photo in person['photos']:
+                image_path = os.path.join(self.faces_dir, name, photo)
                 if not os.path.exists(image_path):
                     continue
                     
@@ -99,7 +100,7 @@ class FaceRecognition:
                 label, confidence = self.face_recognizer.predict(face)
                 
                 # If confidence is too low, skip this face
-                if confidence > 30:  # Lower confidence means better match
+                if confidence > 50:  # Lower confidence means better match
                     continue
                     
                 name = self.label_dict.get(label)
