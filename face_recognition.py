@@ -5,6 +5,16 @@ from typing import List, Tuple, Optional, Dict
 import json
 import asyncio
 from concurrent.futures import ThreadPoolExecutor
+import shutil
+
+# Helper function for creating asyncio tasks
+def create_task(coro):
+    """Create a task that will run in the asyncio event loop"""
+    loop = asyncio.get_event_loop()
+    if loop.is_running():
+        return asyncio.create_task(coro)
+    else:
+        return asyncio.ensure_future(coro)
 
 class FaceRecognition:
     def __init__(self, database_dir: str = "faces/"):
@@ -210,7 +220,7 @@ class FaceRecognition:
         """Start loading the database in the background"""
         if not self.is_loading:
             print("Starting initial database loading...")
-            self.loading_task = asyncio.create_task(self._load_database())
+            self.loading_task = create_task(self._load_database())
             return self.loading_task
         return None
 
@@ -289,7 +299,7 @@ class FaceRecognition:
         for (x, y, w, h) in faces:
             face = gray[y:y+h, x:x+w]
             # Create task for face preprocessing and prediction
-            task = asyncio.create_task(self._process_single_face(face, (x, y, w, h)))
+            task = create_task(self._process_single_face(face, (x, y, w, h)))
             tasks.append(task)
         
         # Wait for all face processing tasks to complete
@@ -327,8 +337,22 @@ class FaceRecognition:
     def add_face(self, image: np.ndarray, name: str, angle: str) -> bool:
         """Add a new face photo to the database"""
         try:
-            # Generate filename
-            filename = f"{name}_{angle}.jpg"
+            # Find the next available ID for this person
+            next_id = 0
+            if name in self.metadata and 'photos' in self.metadata[name]:
+                existing_photos = self.metadata[name]['photos']
+                # Find max ID by parsing existing filenames
+                for photo in existing_photos:
+                    try:
+                        # Extract ID from filename format name_ID.jpg
+                        photo_id = int(photo.split('_')[1].split('.')[0])
+                        next_id = max(next_id, photo_id + 1)
+                    except (IndexError, ValueError):
+                        # Skip files with non-standard naming
+                        pass
+            
+            # Generate filename with sequential ID
+            filename = f"{name}_{next_id}.jpg"
             image_path = os.path.join(self.faces_dir, name, filename)
             os.makedirs(os.path.dirname(image_path), exist_ok=True)
             
@@ -351,101 +375,108 @@ class FaceRecognition:
             self.metadata = self._load_metadata()
             print("Reloaded metadata with new user")
             
-            # Start retraining process
-            if not self.is_loading:
-                asyncio.create_task(self._retrain_model())
+            # Always start retraining process immediately - force it to happen
+            # Create a task and return the result immediately - retraining will happen asynchronously
+            create_task(self._retrain_model())
+            print("Started model retraining after adding new face")
             
             return True
         except Exception as e:
             print(f"Error adding face: {e}")
             return False
 
-    async def _retrain_model(self):
-        """Retrain the model with all faces in the database"""
+    async def add_face_and_wait(self, image: np.ndarray, name: str, angle: str = "") -> bool:
+        """Add a new face photo to the database and wait for retraining to complete"""
         try:
-            # Mark as loading to prevent concurrent retraining attempts
-            if self.is_loading:
-                print("Another loading/training process is already running")
-                return
+            # First add the face normally
+            result = self.add_face(image, name, angle)
+            if not result:
+                return False
                 
-            self.is_loading = True
+            # Then force retraining and wait for it to complete
+            await self._retrain_model()
+            print("Model retraining completed after adding new face")
             
-            # Read the latest metadata from disk
-            fresh_metadata = self._load_metadata()
-            print(f"Reloaded metadata from disk for retraining: {len(fresh_metadata)} persons")
-            
-            # Reset all in-memory data structures
-            faces = []
-            labels = []
-            label_dict = {}
-            self.known_face_names = []
-            self.known_face_encodings = []
-            current_label = 0
-            
-            print("Starting model retraining...")
-            
-            # Process all faces in the database using the fresh metadata
-            for person_name, person_data in fresh_metadata.items():
-                print(f"Processing person: {person_name}")
-                for photo in person_data['photos']:
-                    photo_path = os.path.join(self.faces_dir, person_name, photo)
-                    result = await self._process_face(photo_path, person_name, current_label)
-                    if result is not None:
-                        face, label, name = result
-                        faces.append(face)
-                        labels.append(label)
-                        label_dict[label] = name
-                        print(f"Added face for {name} with label {label}")
-                        current_label += 1
-            
-            # Train with all faces
-            if faces:
-                await self._train_recognizer(faces, labels, label_dict)
-                # Update the main metadata reference with the fresh one
-                self.metadata = fresh_metadata.copy()  # Make a copy to avoid reference issues
-                print(f"Successfully retrained model with {len(faces)} faces")
-                print(f"Final label dictionary: {self.label_dict}")
-                print(f"Final known face names: {self.known_face_names}")
-            else:
-                print("No faces to train on")
-                self.is_trained = False
-                # Reset all data structures if no faces
-                self.label_dict = {}
-                self.known_face_names = []
-                self.known_face_encodings = []
-                self.metadata = {}
+            return True
         except Exception as e:
-            print(f"Error during model retraining: {e}")
-            self.is_trained = False
-            # Reset all data structures on error
-            self.label_dict = {}
-            self.known_face_names = []
-            self.known_face_encodings = []
-            self.metadata = {}
-        finally:
-            # Always release the loading lock
-            self.is_loading = False
+            print(f"Error adding face and waiting: {e}")
+            return False
+
+    async def _retrain_model(self):
+        """Retrain the model with the current metadata (after a face addition or deletion)"""
+        if not self.metadata:
+            print("No metadata available for retraining")
+            return
+            
+        # We'll simply reload the database, which will reconstruct the data and train
+        await self._load_database()
+        print("Model retrained successfully after face modification")
 
     def delete_face(self, name: str) -> bool:
         """Delete a face from the database"""
-        if name in self.metadata:
-            # Delete all photos
-            for filename in self.metadata[name]['photos']:
-                file_path = os.path.join(self.faces_dir, name, filename)
-                if os.path.exists(file_path):
-                    os.remove(file_path)
-            
+        try:
+            # Check if name exists
+            if name not in self.known_face_names:
+                print(f"Face '{name}' not found in database")
+                return False
+                
             # Remove from metadata
-            del self.metadata[name]
-            self._save_metadata()
-            
-            # Start reloading the database
-            self.start_loading_database()
+            if name in self.metadata:
+                del self.metadata[name]
+                self._save_metadata()
+                
+            # Remove the person's directory
+            person_dir = os.path.join(self.faces_dir, name)
+            if os.path.exists(person_dir):
+                shutil.rmtree(person_dir)
+                
+            # Remove from in-memory data
+            if name in self.known_face_names:
+                self.known_face_names.remove(name)
+                
+            # Remove from label_dict
+            new_label_dict = {}
+            for label, label_name in self.label_dict.items():
+                if label_name != name:
+                    new_label_dict[label] = label_name
+            self.label_dict = new_label_dict
+                
+            # We need to retrain the model with the remaining faces
+            create_task(self._retrain_model())
+                
+            print(f"Face '{name}' successfully deleted")
             return True
-        return False
+        except Exception as e:
+            print(f"Error deleting face: {e}")
+            return False
 
-    def get_registered_angles(self, name: str) -> List[str]:
-        """Get list of registered angles for a person"""
-        if name in self.metadata:
-            return [photo.split('_')[1].split('.')[0] for photo in self.metadata[name]['photos']]
-        return [] 
+    def get_photos_count(self, name: str) -> int:
+        """Get the number of registered photos for a person"""
+        if name in self.metadata and 'photos' in self.metadata[name]:
+            return len(self.metadata[name]['photos'])
+        return 0
+
+    def get_photos_for_person(self, name: str) -> List[str]:
+        """Get list of all photo filenames for a person"""
+        if name in self.metadata and 'photos' in self.metadata[name]:
+            return self.metadata[name]['photos']
+        return []
+
+    def cleanup(self):
+        """Clean up resources used by the face recognition system"""
+        try:
+            print("Cleaning up face recognition resources...")
+            # Shutdown thread pool if it exists
+            if hasattr(self, 'thread_pool'):
+                self.thread_pool.shutdown(wait=False)
+                print("Thread pool shutdown completed")
+                
+            # Cancel any pending loading task
+            if self.loading_task and not self.loading_task.done():
+                self.loading_task.cancel()
+                print("Pending loading task cancelled")
+                
+            self.is_loading = False
+            print("Face recognition cleanup completed")
+        except Exception as e:
+            print(f"Error during face recognition cleanup: {e}") 

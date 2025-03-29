@@ -12,8 +12,18 @@ import time
 from pathlib import Path
 import json
 import asyncio
-import qasync
-from qasync import QEventLoop
+
+# Wrapper function for asyncio.create_task to ensure proper threading
+def create_task(coro):
+    """Create a task that will run in the asyncio event loop"""
+    loop = asyncio.get_event_loop()
+    if loop.is_running():
+        # Use the standard asyncio.create_task which will be patched in main()
+        return asyncio.create_task(coro)
+    else:
+        # For tasks created before the event loop is running
+        task = asyncio.ensure_future(coro)
+        return task
 
 class CameraThread(QThread):
     frame_ready = pyqtSignal(np.ndarray)
@@ -215,9 +225,9 @@ class FaceRegistrationDialog(QDialog):
         layout.addWidget(title)
         
         # Add instructions
-        self.instructions = QLabel()
+        self.instructions = QLabel("Move your face in different positions for training.")
         self.instructions.setWordWrap(True)
-        self.instructions.setStyleSheet("margin-bottom: 10px;")
+        self.instructions.setStyleSheet("margin-bottom: 10px; color: white;")
         layout.addWidget(self.instructions)
         
         # Add image display
@@ -232,41 +242,13 @@ class FaceRegistrationDialog(QDialog):
         """)
         layout.addWidget(self.image_label)
         
-        # Add buttons
-        button_layout = QHBoxLayout()
+        # Progress label
+        self.progress_label = QLabel()
+        self.progress_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.progress_label.setStyleSheet("margin-top: 10px; color: white;")
+        layout.addWidget(self.progress_label)
         
-        self.accept_button = QPushButton("Accept")
-        self.accept_button.setStyleSheet("""
-            QPushButton {
-                background-color: #4CAF50;
-                color: white;
-                border: none;
-                padding: 8px 16px;
-                border-radius: 4px;
-                font-weight: bold;
-            }
-            QPushButton:hover {
-                background-color: #45a049;
-            }
-        """)
-        self.accept_button.clicked.connect(self.accept_photo)
-        
-        self.redo_button = QPushButton("Redo")
-        self.redo_button.setStyleSheet("""
-            QPushButton {
-                background-color: #f44336;
-                color: white;
-                border: none;
-                padding: 8px 16px;
-                border-radius: 4px;
-                font-weight: bold;
-            }
-            QPushButton:hover {
-                background-color: #da190b;
-            }
-        """)
-        self.redo_button.clicked.connect(self.redo_photo)
-        
+        # Cancel button
         self.cancel_button = QPushButton("Cancel")
         self.cancel_button.setStyleSheet("""
             QPushButton {
@@ -282,62 +264,101 @@ class FaceRegistrationDialog(QDialog):
             }
         """)
         self.cancel_button.clicked.connect(self.reject)
-        
-        button_layout.addWidget(self.accept_button)
-        button_layout.addWidget(self.redo_button)
-        button_layout.addWidget(self.cancel_button)
-        layout.addLayout(button_layout)
-        
-        # Add progress label
-        self.progress_label = QLabel()
-        self.progress_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.progress_label.setStyleSheet("margin-top: 10px;")
-        layout.addWidget(self.progress_label)
+        layout.addWidget(self.cancel_button)
         
         self.setLayout(layout)
         
         # Initialize variables
-        self.current_step = 0
-        self.steps = [
-            ("front", "Look directly at the camera"),
-            ("left", "Turn your head slightly to the left"),
-            ("right", "Turn your head slightly to the right"),
-            ("up", "Look slightly upward"),
-            ("down", "Look slightly downward"),
-            ("front2", "Look directly at the camera again")
-        ]
-        self.current_image = None
         self.name = None
+        self.current_image = None
+        self.display_image_with_rect = None  # Image with rectangle overlay
+        self.taken_photos = 0
+        self.face_detector = cv2.CascadeClassifier(cv2.data.haarcascades + "haarcascade_frontalface_default.xml")
+        
+        # Recognition variables
+        self.green_start_time = 0  # When the face started being recognized (green)
+        self.required_recognition_time = 5.0  # Seconds of consecutive recognition required
+        self.is_recognized = False  # Current recognition state
+        self.last_face_location = None  # Track last detected face location
+        
+        # Timers
+        self.process_timer = QTimer()  # Timer for processing frames
+        self.process_timer.timeout.connect(self.process_current_frame)
+        self.process_timer.setInterval(100)  # Process frames every 100ms
+        
+        self.photo_timer = QTimer()  # Timer for taking photos
+        self.photo_timer.timeout.connect(self.check_take_photo)
+        self.photo_timer.setInterval(500)  # Take photos every 500ms
         
     def set_name(self, name):
         """Set the name for the face being registered"""
         self.name = name
-        self.update_ui()
+        self.person_dir = Path("faces/faces") / name
+        self.person_dir.mkdir(parents=True, exist_ok=True)
+        self.update_progress()
         
-    def update_ui(self):
-        """Update the UI based on current step"""
-        if self.current_step < len(self.steps):
-            angle, instruction = self.steps[self.current_step]
-            self.instructions.setText(instruction)
-            self.progress_label.setText(f"Step {self.current_step + 1} of {len(self.steps)}")
-            self.accept_button.setEnabled(True)
-            self.redo_button.setEnabled(True)
+    def update_progress(self):
+        """Update the progress label"""
+        if self.is_recognized:
+            time_left = max(0, self.required_recognition_time - (time.time() - self.green_start_time))
+            self.progress_label.setText(f"Face recognized! Keep position for {time_left:.1f} seconds")
+            self.progress_label.setStyleSheet("margin-top: 10px; color: #00FF00; font-weight: bold;")
         else:
-            self.instructions.setText("Registration complete!")
-            self.progress_label.setText("All steps completed")
-            self.accept_button.setEnabled(False)
-            self.redo_button.setEnabled(False)
+            self.progress_label.setText(f"Photos taken: {self.taken_photos} - Move your face around")
+            self.progress_label.setStyleSheet("margin-top: 10px; color: white;")
             
     def set_image(self, image):
         """Set the current camera image"""
-        self.current_image = image
-        self.display_image()
+        self.current_image = image.copy()
+        
+    def draw_face_rectangle(self, image, face_location, is_recognized):
+        """Draw rectangle around detected face"""
+        if face_location is None:
+            return image.copy()
+            
+        display_image = image.copy()
+        x, y, w, h = face_location
+        
+        # Set color based on recognition status
+        if is_recognized:
+            color = (0, 255, 0)  # Green for recognized
+            text = "Recognized"
+        else:
+            color = (0, 0, 255)  # Red for unrecognized
+            text = "Learning..."
+            
+        # Draw rectangle around face
+        cv2.rectangle(display_image, (x, y), (x+w, y+h), color, 2)
+        
+        # Add text
+        font = cv2.FONT_HERSHEY_SIMPLEX
+        font_scale = 0.7
+        thickness = 2
+        (text_width, text_height), baseline = cv2.getTextSize(text, font, font_scale, thickness)
+        
+        # Draw background for text
+        cv2.rectangle(display_image, 
+                     (x, y - text_height - 10), 
+                     (x + text_width + 10, y - 5), 
+                     color, 
+                     -1)  # -1 fills the rectangle
+        
+        # Add text
+        text_color = (0, 0, 0) if is_recognized else (255, 255, 255)  # Black on green, white on red
+        cv2.putText(display_image, text, 
+                   (x + 5, y - 10), 
+                   font, 
+                   font_scale, 
+                   text_color,
+                   thickness)
+                   
+        return display_image
         
     def display_image(self):
-        """Display the current image"""
-        if self.current_image is not None:
+        """Display the current image with face rectangle"""
+        if self.display_image_with_rect is not None:
             # Convert to RGB for display
-            rgb_image = cv2.cvtColor(self.current_image, cv2.COLOR_BGR2RGB)
+            rgb_image = cv2.cvtColor(self.display_image_with_rect, cv2.COLOR_BGR2RGB)
             h, w, ch = rgb_image.shape
             bytes_per_line = ch * w
             
@@ -353,34 +374,173 @@ class FaceRegistrationDialog(QDialog):
             
             self.image_label.setPixmap(scaled_pixmap)
             
-    def accept_photo(self):
-        """Accept the current photo and move to next step"""
-        if self.current_step < len(self.steps):
-            angle, _ = self.steps[self.current_step]
+    def showEvent(self, event):
+        """Called when dialog is shown"""
+        super().showEvent(event)
+        # Start processing frames and taking photos
+        self.process_timer.start()
+        self.photo_timer.start()
+        
+    def closeEvent(self, event):
+        """Called when dialog is closed"""
+        # Stop all timers when dialog closes
+        self.process_timer.stop()
+        self.photo_timer.stop()
+        super().closeEvent(event)
+    
+    def check_take_photo(self):
+        """Timer callback to take photo every 0.5 seconds if needed"""
+        if self.current_image is None or self.last_face_location is None:
+            return
             
-            # Save the photo
-            person_dir = Path("faces/faces") / self.name
-            if angle == "front2":
-                # For the second front photo, use a different name
-                filename = f"{self.name}_front2.jpg"
+        # Skip taking photo if face is already recognized for required time
+        if self.is_recognized and (time.time() - self.green_start_time) >= self.required_recognition_time:
+            return
+            
+        # Take the photo
+        self.take_photo(self.last_face_location)
+            
+    def process_current_frame(self):
+        """Process the current frame to detect faces and check recognition"""
+        if self.current_image is None:
+            return
+            
+        # Convert to grayscale for face detection
+        gray = cv2.cvtColor(self.current_image, cv2.COLOR_BGR2GRAY)
+        
+        # Detect faces
+        faces = self.face_detector.detectMultiScale(
+            gray,
+            scaleFactor=1.1,
+            minNeighbors=5,
+            minSize=(30, 30)
+        )
+        
+        # Create a copy of current image for drawing
+        self.display_image_with_rect = self.current_image.copy()
+        
+        if len(faces) == 0:
+            # No faces detected
+            self.is_recognized = False
+            self.green_start_time = 0
+            self.last_face_location = None
+            self.instructions.setText("No face detected. Please position your face in front of the camera.")
+            self.display_image()
+            return
+            
+        if len(faces) > 1:
+            # Multiple faces detected
+            self.is_recognized = False
+            self.green_start_time = 0
+            self.last_face_location = None
+            self.instructions.setText("Multiple faces detected. Please ensure only one face is visible.")
+            self.display_image()
+            return
+            
+        # We have exactly one face
+        self.last_face_location = faces[0]
+        x, y, w, h = self.last_face_location
+        
+        # Check if the recognizer is trained and can recognize the face
+        if hasattr(self.parent(), 'face_recognizer') and self.taken_photos >= 3:
+            face_recognizer = self.parent().face_recognizer
+            if face_recognizer.is_trained:
+                # Create task for face recognition
+                async def check_recognition():
+                    recognized_faces = await face_recognizer.recognize_face(self.current_image)
+                    
+                    # Check if the face is recognized as the new person
+                    recognized = False
+                    for result in recognized_faces:
+                        name, confidence, face_location = result
+                        if name == self.name:
+                            recognized = True
+                            break
+                            
+                    # Update recognition state
+                    if recognized:
+                        # Face is recognized - should be green
+                        if not self.is_recognized:
+                            # Just started being recognized
+                            self.is_recognized = True
+                            self.green_start_time = time.time()
+                        
+                        # Check if recognized for required time
+                        if (time.time() - self.green_start_time) >= self.required_recognition_time:
+                            # Successfully recognized for required time
+                            self.process_timer.stop()
+                            self.photo_timer.stop()
+                            
+                            # Show success message
+                            QMessageBox.information(self, "Registration Complete", 
+                                                  f"Face for {self.name} has been successfully registered!")
+                            self.accept()
+                            return
+                    else:
+                        # Face is not recognized - should be red
+                        self.is_recognized = False
+                        self.green_start_time = 0
+                    
+                    # Draw rectangle with current recognition state
+                    self.display_image_with_rect = self.draw_face_rectangle(
+                        self.current_image, self.last_face_location, self.is_recognized)
+                    self.display_image()
+                    
+                    # Update UI
+                    self.update_progress()
+                        
+                create_task(check_recognition())
             else:
-                filename = f"{self.name}_{angle}.jpg"
+                # Recognizer not trained yet
+                self.is_recognized = False
+                self.display_image_with_rect = self.draw_face_rectangle(
+                    self.current_image, self.last_face_location, False)
+                self.display_image()
+        else:
+            # Not enough photos yet or no recognizer
+            self.is_recognized = False
+            self.display_image_with_rect = self.draw_face_rectangle(
+                self.current_image, self.last_face_location, False)
+            self.display_image()
+    
+    def take_photo(self, face_location):
+        """Take a photo of the detected face and retrain"""
+        x, y, w, h = face_location
             
-            photo_path = person_dir / filename
-            cv2.imwrite(str(photo_path), self.current_image)
+        # Extract face region
+        face_img = self.current_image[y:y+h, x:x+w]
+        
+        # Create a task to add the face and wait for retraining
+        async def add_face_and_retrain():
+            # Add the face and wait for retraining to complete
+            await self.parent().face_recognizer.add_face_and_wait(face_img, self.name)
+            # Update UI after retraining is complete
+            self.update_progress()
             
-            # Move to next step
-            self.current_step += 1
-            self.update_ui()
+        # Start the task
+        create_task(add_face_and_retrain())
+        
+        # Increment counter
+        self.taken_photos += 1
+        
+        # Update progress label
+        self.update_progress()
+    
+    def retrain_recognizer(self):
+        """Retrain the face recognizer with the new photos"""
+        if not hasattr(self.parent(), 'face_recognizer'):
+            return
             
-            # If all steps are complete, accept the dialog
-            if self.current_step >= len(self.steps):
-                self.accept()
-                
-    def redo_photo(self):
-        """Redo the current photo"""
-        # No need to do anything, just wait for next frame
-        pass
+        # Update metadata
+        self.parent().update_metadata()
+        
+        # Set instruction based on recognition state
+        if self.is_recognized:
+            self.instructions.setText("Face recognized! Keep position.")
+            self.instructions.setStyleSheet("margin-bottom: 10px; color: #00FF00; font-weight: bold;")
+        else:
+            self.instructions.setText("Keep moving your face until it's recognized (green rectangle).")
+            self.instructions.setStyleSheet("margin-bottom: 10px; color: white;")
 
 class RecognitionPopupDialog(QDialog):
     def __init__(self, name: str, confidence: float, face_image: np.ndarray, parent=None):
@@ -479,6 +639,11 @@ class FaceRecognitionGUI(QMainWindow):
         self.active_dialogs = 0
         self.current_image = None
         
+        # Initialize variables for multiple image updates
+        self.update_timer = None
+        self.update_count = 0
+        self.max_updates = 5
+        
         # Ensure faces directory exists
         faces_dir = Path("faces/faces")
         faces_dir.mkdir(parents=True, exist_ok=True)
@@ -569,7 +734,6 @@ class FaceRecognitionGUI(QMainWindow):
         people_layout = QHBoxLayout()
         people_label = ModernLabel("Person:")
         self.people_combo = ModernComboBox()
-        # self.update_people_combo()  # Populate the combo box - удалено, т.к. вызывается преждевременно
         people_layout.addWidget(people_label)
         people_layout.addWidget(self.people_combo)
         middle_layout.addLayout(people_layout)
@@ -653,7 +817,7 @@ class FaceRecognitionGUI(QMainWindow):
         # Initialize variables
         self.camera_thread = None
         
-        # Add recognition timer
+        # Add recognition timer (using regular method, not async)
         self.recognition_timer = QTimer()
         self.recognition_timer.timeout.connect(self.check_for_faces)
         self.recognition_timer.start(3000)  # Check every 3000ms
@@ -714,19 +878,72 @@ class FaceRecognitionGUI(QMainWindow):
         if file_path:
             self.current_image = cv2.imread(file_path)
             if self.current_image is not None:
+                # Сбросим счетчик для мгновенного распознавания
+                self.detection_counter = 0
+                
+                # Выполним распознавание лиц сразу
+                self.last_detected_faces = self.face_recognizer.detect_faces(self.current_image)
+                
+                # Создадим задачу для распознавания
+                async def immediate_recognition():
+                    self.last_recognized_faces = await self.face_recognizer.recognize_face(self.current_image)
+                    # Если есть лица в кадре, их нужно обработать
+                    if self.is_locked and self.locked_name:
+                        for result in self.last_recognized_faces:
+                            name, confidence, (x, y, w, h) = result
+                            if name == self.locked_name:
+                                self.locked_face = self.current_image[y:y+h, x:x+w]
+                                self.locked_confidence = confidence
+                                self.display_locked_face()
+                                break
+                
+                # Запустим асинхронную задачу
+                create_task(immediate_recognition())
+                
+                # Обновим отображение
                 self.display_image(self.current_image)
                 self.status_label.setText("Image loaded successfully")
+
+                # Настроим счетчик для множественного обновления кадра
+                self.update_count = 0
+                self.max_updates = 5  # Количество обновлений
+                
+                # Остановим предыдущий таймер, если он существует и активен
+                if self.update_timer and self.update_timer.isActive():
+                    self.update_timer.stop()
+                
+                # Создаем таймер для периодического обновления
+                self.update_timer = QTimer()
+                self.update_timer.timeout.connect(self.update_loaded_image)
+                self.update_timer.start(500)  # Интервал между обновлениями - 500 мс
             else:
                 QMessageBox.critical(self, "Error", "Failed to load image")
+                
+    def update_loaded_image(self):
+        """Обновляет отображение загруженного изображения несколько раз"""
+        if self.current_image is not None:
+            # Обновляем изображение
+            self.display_image(self.current_image)
+            
+            # Увеличиваем счетчик обновлений
+            self.update_count += 1
+            
+            # Если достигнуто максимальное количество обновлений, останавливаем таймер
+            if self.update_count >= self.max_updates:
+                self.update_timer.stop()
+                self.status_label.setText("Image processing completed")
 
     def display_image(self, image):
         # Create a copy of the image for drawing
         display_image = image.copy()
         
         # Standard face detection and recognition
-        # Update recognition status every 30 frames
+        # Update recognition status every 30 frames or when counter is 0
         self.detection_counter += 1
-        if self.detection_counter >= 30:
+        
+        # Если счетчик равен 1, значит он только что был сброшен в другом методе и распознавание уже запущено
+        # Поэтому пропускаем обновление распознавания в этом случае
+        if self.detection_counter >= 30 and self.detection_counter != 1:
             self.detection_counter = 0
             # Update last known faces
             self.last_detected_faces = self.face_recognizer.detect_faces(image)
@@ -734,7 +951,7 @@ class FaceRecognitionGUI(QMainWindow):
             async def update_recognition():
                 self.last_recognized_faces = await self.face_recognizer.recognize_face(image)
                 # Note: Lock button is now enabled/disabled in update_people_combo method
-            asyncio.create_task(update_recognition())
+            create_task(update_recognition())
         
         # Draw rectangles for all detected faces
         for (x, y, w, h) in self.last_detected_faces:
@@ -742,11 +959,24 @@ class FaceRecognitionGUI(QMainWindow):
             recognized = False
             name = None
             confidence = None
+            confidence_pct = 0  # Инициализация переменной
+            
             for result in self.last_recognized_faces:
                 if (x, y, w, h) == result[2]:  # Compare face locations
                     recognized = True
                     name = result[0]  # Get name from result
                     confidence = result[1]  # Get confidence from result
+                    
+                    # Convert confidence to percentage (higher is better)
+                    # LBPH confidence is 0-100 where lower is better, so we invert it
+                    confidence_pct = max(0, min(100, 100 - confidence))  # Clamp between 0-100
+                    
+                    # If confidence is less than 10%, treat as unknown
+                    if confidence_pct < 10:
+                        recognized = False
+                        name = None
+                        confidence = None
+                    
                     break
             
             # Skip if locked to a specific person and this is not that person
@@ -762,10 +992,6 @@ class FaceRecognitionGUI(QMainWindow):
                     
                 # Draw green rectangle for recognized faces
                 cv2.rectangle(display_image, (x, y), (x+w, y+h), (0, 255, 0), 2)
-                # Add name and confidence above the rectangle
-                # Convert confidence to percentage (higher is better)
-                # LBPH confidence is 0-100 where lower is better, so we invert it
-                confidence_pct = max(0, min(100, 100 - confidence))  # Clamp between 0-100
                 
                 # Color gradient based on confidence
                 if confidence_pct >= 90:
@@ -886,51 +1112,120 @@ class FaceRecognitionGUI(QMainWindow):
         person_dir = Path("faces/faces") / name
         person_dir.mkdir(parents=True, exist_ok=True)
         
+        # If using a loaded image instead of camera
+        if self.current_image is not None and (not self.camera_thread or not self.camera_thread.isRunning()):
+            # Check if we have detected faces in the current image
+            if not hasattr(self, 'last_detected_faces') or len(self.last_detected_faces) == 0:
+                # Try to detect faces in the current image
+                self.last_detected_faces = self.face_recognizer.detect_faces(self.current_image)
+                
+            if not self.last_detected_faces or len(self.last_detected_faces) == 0:
+                QMessageBox.warning(self, "Warning", "No faces detected in the current image")
+                return
+                
+            if len(self.last_detected_faces) > 1:
+                QMessageBox.warning(self, "Warning", "Multiple faces detected. Please use an image with a single face.")
+                return
+                
+            # Extract and save the detected face
+            x, y, w, h = self.last_detected_faces[0]
+            face_img = self.current_image[y:y+h, x:x+w]
+            
+            # Create a task to add the face and wait for retraining
+            async def add_face_and_wait_for_loaded_image():
+                # Add the face and wait for retraining to complete
+                success = await self.face_recognizer.add_face_and_wait(face_img, name)
+                if success:
+                    # Update UI after retraining is complete
+                    self.status_label.setText(f'Face "{name}" added successfully and model retrained!')
+                    self.name_entry.clear()
+                    self.update_people_combo()
+                else:
+                    QMessageBox.warning(self, "Warning", f"Failed to add face for {name}")
+            
+            # Start the task
+            create_task(add_face_and_wait_for_loaded_image())
+            
+            # Show temporary message
+            self.status_label.setText(f'Adding face for "{name}" and retraining model...')
+            return
+            
+        # Make sure camera is started for live registration
+        camera_was_off = False
+        if not self.camera_thread or not self.camera_thread.isRunning():
+            self.start_camera()
+            camera_was_off = True
+            # Give the camera a moment to initialize
+            QMessageBox.information(self, "Camera Started", 
+                "Camera has been started for face registration. Position your face in the camera view.")
+        
+        # Signal to the user that we're entering registration mode
+        self.dialog_opened()  # Pause normal scanning
+        self.status_label.setText(f"Starting face registration for {name}...")
+            
         # Create registration dialog
         dialog = FaceRegistrationDialog(self)
         dialog.set_name(name)
         
-        # Connect camera frame to dialog
-        self.camera_thread.frame_ready.connect(dialog.set_image)
-        
-        if dialog.exec() == QDialog.DialogCode.Accepted:
-            # Update metadata
-            self.update_metadata()
+        # Ensure camera thread exists and is running before connecting
+        if self.camera_thread and self.camera_thread.isRunning():
+            # Connect camera frame to dialog
+            self.camera_thread.frame_ready.connect(dialog.set_image)
             
-            # Save metadata to file by scanning faces directory
-            metadata = []
-            faces_dir = Path("faces/faces")
-            if faces_dir.exists():
-                for person_dir in faces_dir.iterdir():
-                    if person_dir.is_dir():
-                        person_name = person_dir.name
-                        person_photos = []
-                        # Add all photos from person's directory
-                        for photo in person_dir.glob("*.jpg"):
-                            person_photos.append(photo.name)
-                        if person_photos:
-                            metadata.append({
-                                "name": person_name,
-                                "photos": person_photos
-                            })
+            if dialog.exec() == QDialog.DialogCode.Accepted:
+                # Update metadata
+                self.update_metadata()
+                
+                # Save metadata to file by scanning faces directory
+                metadata = []
+                faces_dir = Path("faces/faces")
+                if faces_dir.exists():
+                    for person_dir in faces_dir.iterdir():
+                        if person_dir.is_dir():
+                            person_name = person_dir.name
+                            person_photos = []
+                            # Add all photos from person's directory
+                            for photo in person_dir.glob("*.jpg"):
+                                person_photos.append(photo.name)
+                            if person_photos:
+                                metadata.append({
+                                    "name": person_name,
+                                    "photos": person_photos
+                                })
+                
+                # Save metadata to file
+                metadata_path = Path("faces/metadata.json")
+                with open(metadata_path, 'w') as f:
+                    json.dump(metadata, f, indent=4)
+                
+                # Update people in combo box
+                self.update_people_combo()
+                
+                self.status_label.setText(f'Face "{name}" added successfully!')
+                self.name_entry.clear()  # Clear the name field after successful registration
+            else:
+                # Clean up if cancelled
+                # Check if the directory was created and is empty
+                if person_dir.exists() and not any(person_dir.iterdir()):
+                    person_dir.rmdir()
+                self.status_label.setText("Face registration cancelled")
             
-            # Save metadata to file
-            metadata_path = Path("faces/metadata.json")
-            with open(metadata_path, 'w') as f:
-                json.dump(metadata, f, indent=4)
-            
-            # Update people in combo box
-            self.update_people_combo()
-            
-            QMessageBox.information(self, 'Success', f'Face "{name}" added successfully!')
-            self.name_entry.clear()  # Clear the name field after successful registration
+            # Disconnect camera frame
+            try:
+                self.camera_thread.frame_ready.disconnect(dialog.set_image)
+            except TypeError:
+                # Handle case where connection doesn't exist
+                pass
         else:
-            # Clean up if cancelled
-            if not any(person_dir.iterdir()):
-                person_dir.rmdir()
+            QMessageBox.critical(self, "Error", "Camera could not be started or is not available")
+            return
         
-        # Disconnect camera frame
-        self.camera_thread.frame_ready.disconnect(dialog.set_image)
+        # Resume normal scanning
+        self.dialog_closed()
+        
+        # If camera was off before, turn it off again
+        if camera_was_off:
+            self.stop_camera()
 
     def delete_face(self):
         name = self.name_entry.text().strip()
@@ -966,9 +1261,9 @@ class FaceRecognitionGUI(QMainWindow):
             await self.loading_task
             self.update_people_combo()
             
-        asyncio.create_task(update_combo_after_loading())
+        create_task(update_combo_after_loading())
 
-    async def check_for_faces(self):
+    def check_for_faces(self):
         """Automatically check for faces in the current image (simplified)"""
         if not self.is_scanning or self.current_image is None or self.active_dialogs > 0:
             return
@@ -976,9 +1271,23 @@ class FaceRecognitionGUI(QMainWindow):
         # Face detection is already handled in display_image, no need for duplicate processing here
 
     def closeEvent(self, event):
+        """Handle application close event by cleaning up resources"""
+        print("Application closing, cleaning up resources...")
+        
+        # Stop the camera
         self.stop_camera()
+        
+        # Stop all timers
         self.recognition_timer.stop()
+        if self.update_timer and self.update_timer.isActive():
+            self.update_timer.stop()
+        
+        # Clean up face recognizer
+        if hasattr(self, 'face_recognizer'):
+            self.face_recognizer.cleanup()
+            
         event.accept()
+        print("Application cleanup completed")
 
     def update_people_combo(self):
         """Update the list of people in the combo box directly from metadata.json"""
@@ -1130,19 +1439,62 @@ class FaceRecognitionGUI(QMainWindow):
         self.recognized_faces_layout.addWidget(info_frame)
 
 def main():
+    """Main application entry point with asyncio-Qt integration"""
     app = QApplication(sys.argv)
     
-    # Create event loop
-    loop = QEventLoop(app)
+    # Create a custom event loop that integrates with Qt
+    loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
+    
+    # Store all tasks that need to be canceled on exit
+    pending_tasks = set()
+    
+    # Override the create_task function to track tasks
+    old_create_task = asyncio.create_task
+    def patched_create_task(coro):
+        task = old_create_task(coro)
+        # Add task to tracking set
+        pending_tasks.add(task)
+        # Remove task from set when it's done
+        task.add_done_callback(pending_tasks.discard)
+        return task
+    
+    # Replace the built-in create_task with our tracked version
+    asyncio.create_task = patched_create_task
     
     # Create and show the main window
     window = FaceRecognitionGUI()
     window.show()
     
-    # Run the event loop
-    with loop:
+    # Set up a periodic callback to process asyncio events
+    def process_asyncio_events():
+        loop.call_soon(loop.stop)
         loop.run_forever()
+    
+    # Create timer to process asyncio events
+    asyncio_timer = QTimer()
+    asyncio_timer.timeout.connect(process_asyncio_events)
+    asyncio_timer.start(10)  # 10ms interval for processing asyncio events
+    
+    # Start the Qt event loop
+    try:
+        sys.exit(app.exec())
+    finally:
+        # Cancel all pending tasks before closing loop
+        print(f"Cancelling {len(pending_tasks)} pending tasks...")
+        for task in pending_tasks:
+            task.cancel()
+        
+        # Run the event loop one last time to let cancelled tasks clean up
+        if pending_tasks:
+            loop.run_until_complete(asyncio.gather(*pending_tasks, return_exceptions=True))
+        
+        # Restore original create_task function
+        asyncio.create_task = old_create_task
+        
+        # Clean up the loop when the application exits
+        loop.close()
+        print("Event loop closed successfully")
 
 if __name__ == '__main__':
     main()
