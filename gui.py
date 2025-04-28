@@ -13,6 +13,16 @@ from pathlib import Path
 import json
 import asyncio
 
+# Global timing configuration
+RECOGNITION_CHECK_INTERVAL = 200  # ms between face recognition checks
+FACE_DETECTION_INTERVAL = 3  # frames between face detection updates
+PROCESS_FRAME_INTERVAL = 100  # ms between frame processing
+TAKE_PHOTO_INTERVAL = 200  # ms between taking photos
+REQUIRED_RECOGNITION_TIME = 3.0  # seconds of consecutive recognition required
+MAX_IMAGE_UPDATES = 5  # number of times to update loaded image
+IMAGE_UPDATE_INTERVAL = 200  # ms between image updates
+ASYNCIO_PROCESSING_INTERVAL = 10  # ms for asyncio event processing
+
 # Wrapper function for asyncio.create_task to ensure proper threading
 def create_task(coro):
     """Create a task that will run in the asyncio event loop"""
@@ -273,11 +283,11 @@ class FaceRegistrationDialog(QDialog):
         self.current_image = None
         self.display_image_with_rect = None  # Image with rectangle overlay
         self.taken_photos = 0
-        self.face_detector = cv2.CascadeClassifier(cv2.data.haarcascades + "haarcascade_frontalface_default.xml")
+        self.face_detector = cv2.CascadeClassifier( "/home/wudado/opencv/data/haarcascades_cuda/" + "haarcascade_frontalface_default.xml")
         
-        # Recognition variables
+        # Recognition variables 
         self.green_start_time = 0  # When the face started being recognized (green)
-        self.required_recognition_time = 5.0  # Seconds of consecutive recognition required
+        self.required_recognition_time = REQUIRED_RECOGNITION_TIME  # Seconds of consecutive recognition required
         self.is_recognized = False  # Current recognition state
         self.last_face_location = None  # Track last detected face location
         self.original_face_location = None  # Original face coordinates in the full image
@@ -285,11 +295,11 @@ class FaceRegistrationDialog(QDialog):
         # Timers
         self.process_timer = QTimer()  # Timer for processing frames
         self.process_timer.timeout.connect(self.process_current_frame)
-        self.process_timer.setInterval(100)  # Process frames every 100ms
+        self.process_timer.setInterval(PROCESS_FRAME_INTERVAL)  # Process frames every 100ms
         
         self.photo_timer = QTimer()  # Timer for taking photos
         self.photo_timer.timeout.connect(self.check_take_photo)
-        self.photo_timer.setInterval(500)  # Take photos every 500ms
+        self.photo_timer.setInterval(TAKE_PHOTO_INTERVAL)  # Take photos every 500ms
         
         # Flag to track if we've shown a completion dialog
         self.completion_dialog_shown = False
@@ -739,7 +749,7 @@ class FaceRecognitionGUI(QMainWindow):
         # Initialize variables for multiple image updates
         self.update_timer = None
         self.update_count = 0
-        self.max_updates = 5
+        self.max_updates = MAX_IMAGE_UPDATES
         
         # Ensure faces directory exists
         faces_dir = Path("faces/faces")
@@ -950,7 +960,7 @@ class FaceRecognitionGUI(QMainWindow):
         # Add recognition timer (using regular method, not async)
         self.recognition_timer = QTimer()
         self.recognition_timer.timeout.connect(self.check_for_faces)
-        self.recognition_timer.start(500)  # Check every 3000ms
+        self.recognition_timer.start(RECOGNITION_CHECK_INTERVAL)  # Check every 500ms
         
         # Initialize recognition variables
         self.last_recognition_time = 0
@@ -1039,7 +1049,7 @@ class FaceRecognitionGUI(QMainWindow):
 
                 # Настроим счетчик для множественного обновления кадра
                 self.update_count = 0
-                self.max_updates = 5  # Количество обновлений
+                self.max_updates = MAX_IMAGE_UPDATES  # Количество обновлений
                 
                 # Остановим предыдущий таймер, если он существует и активен
                 if self.update_timer and self.update_timer.isActive():
@@ -1048,7 +1058,7 @@ class FaceRecognitionGUI(QMainWindow):
                 # Создаем таймер для периодического обновления
                 self.update_timer = QTimer()
                 self.update_timer.timeout.connect(self.update_loaded_image)
-                self.update_timer.start(500)  # Интервал между обновлениями - 500 мс
+                self.update_timer.start(IMAGE_UPDATE_INTERVAL)  # Интервал между обновлениями - 500 мс
             else:
                 QMessageBox.critical(self, "Error", "Failed to load image")
                 
@@ -1076,7 +1086,7 @@ class FaceRecognitionGUI(QMainWindow):
         
         # Если счетчик равен 1, значит он только что был сброшен в другом методе и распознавание уже запущено
         # Поэтому пропускаем обновление распознавания в этом случае
-        if self.detection_counter >= 30 and self.detection_counter != 1:
+        if self.detection_counter >= FACE_DETECTION_INTERVAL and self.detection_counter != 1:
             self.detection_counter = 0
             # Update last known faces
             self.last_detected_faces = self.face_recognizer.detect_faces(image)
@@ -1736,7 +1746,7 @@ def main():
     # Create timer to process asyncio events
     asyncio_timer = QTimer()
     asyncio_timer.timeout.connect(process_asyncio_events)
-    asyncio_timer.start(10)  # 10ms interval for processing asyncio events
+    asyncio_timer.start(ASYNCIO_PROCESSING_INTERVAL)  # 10ms interval for processing asyncio events
     
     # Start the Qt event loop
     try:

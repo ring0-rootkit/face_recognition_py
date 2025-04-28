@@ -32,9 +32,10 @@ class FaceRecognition:
         if self.use_gpu:
             try:
                 # Check if OpenCV was built with CUDA support
-                if cv2.cuda.getCudaEnabledDeviceCount() > 0:
+                cuda_devices = cv2.cuda.getCudaEnabledDeviceCount()
+                if cuda_devices > 0:
                     self.has_gpu = True
-                    print(f"✅ GPU acceleration enabled with {cv2.cuda.getCudaEnabledDeviceCount()} CUDA device(s)")
+                    print(f"✅ GPU acceleration enabled with {cuda_devices} CUDA device(s)")
                     # Initialize CUDA device
                     cv2.cuda.setDevice(self.gpu_device_id)
                     # Create a CUDA Stream for asynchronous operations
@@ -43,13 +44,18 @@ class FaceRecognition:
                     self.has_gpu = False
                     self.use_gpu = False
                     print("⚠️ GPU acceleration requested but no CUDA devices found. Falling back to CPU.")
+                    print("   Please check if your GPU drivers are properly installed.")
+                    print("   For NVIDIA GPUs, run 'nvidia-smi' to verify driver status.")
             except Exception as e:
                 self.has_gpu = False
                 self.use_gpu = False
                 print(f"⚠️ Error initializing GPU: {e}. Falling back to CPU.")
+                print("   Your OpenCV installation might not be compiled with CUDA support.")
+                print("   Try running: python -c \"import cv2; print(cv2.getBuildInformation())\" | grep -i cuda")
+                print("   to check if CUDA modules are available in your OpenCV build.")
         
         # Initialize face detector
-        self.face_detector = cv2.CascadeClassifier(cv2.data.haarcascades + "haarcascade_frontalface_default.xml")
+        self.face_detector = cv2.CascadeClassifier("/home/wudado/opencv/data/haarcascades_cuda/haarcascade_frontalface_default.xml")
         
         # Initialize GPU-accelerated face detector if available
         if self.has_gpu:
@@ -60,6 +66,7 @@ class FaceRecognition:
             except Exception as e:
                 print(f"⚠️ Could not initialize GPU acceleration: {e}. Using CPU only.")
                 self.has_gpu = False  # Disable GPU if initialization fails
+                self.use_gpu = False
         
         # Initialize face recognizer
         self.face_recognizer = cv2.face.LBPHFaceRecognizer_create()
