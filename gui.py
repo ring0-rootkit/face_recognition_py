@@ -38,13 +38,14 @@ def create_task(coro):
 class CameraThread(QThread):
     frame_ready = pyqtSignal(np.ndarray)
     
-    def __init__(self):
+    def __init__(self, camera_index=0):
         super().__init__()
         self.running = False
         self.camera = None
+        self.camera_index = camera_index
         
     def run(self):
-        self.camera = cv2.VideoCapture(0)
+        self.camera = cv2.VideoCapture(self.camera_index)
         self.running = True
         
         while self.running:
@@ -743,6 +744,8 @@ class FaceRecognitionGUI(QMainWindow):
         self.is_scanning = True
         self.active_dialogs = 0
         self.current_image = None
+        self.selected_camera_index = 0  # Default camera index
+        self.camera_thread = None  # Initialize camera thread variable
 
         self.use_gpu = True
         
@@ -814,6 +817,16 @@ class FaceRecognitionGUI(QMainWindow):
         self.upload_button = ModernButton("Upload Image")
         self.upload_button.clicked.connect(self.load_image)
         
+        # Add camera selection dropdown
+        camera_select_layout = QHBoxLayout()
+        camera_label = ModernLabel("Camera:")
+        self.camera_combo = ModernComboBox()
+        self.camera_combo.currentIndexChanged.connect(self.on_camera_selected)
+        self.update_camera_list()
+        camera_select_layout.addWidget(camera_label)
+        camera_select_layout.addWidget(self.camera_combo)
+        
+        camera_layout.addLayout(camera_select_layout)
         camera_layout.addWidget(self.camera_button)
         camera_layout.addWidget(self.upload_button)
         left_layout.addLayout(camera_layout)
@@ -984,7 +997,7 @@ class FaceRecognitionGUI(QMainWindow):
             self.stop_camera()
 
     def start_camera(self):
-        self.camera_thread = CameraThread()
+        self.camera_thread = CameraThread(self.selected_camera_index)
         self.camera_thread.frame_ready.connect(self.update_camera_frame)
         self.camera_thread.start()
         self.is_scanning = True
@@ -1709,6 +1722,30 @@ class FaceRecognitionGUI(QMainWindow):
             self.update_people_combo()
             
         create_task(update_status_after_loading())
+
+    def update_camera_list(self):
+        """Update the list of available cameras in the combo box"""
+        self.camera_combo.clear()
+        # Try to detect available cameras
+        for i in range(10):  # Check first 10 indices
+            cap = cv2.VideoCapture(i)
+            if cap.isOpened():
+                self.camera_combo.addItem(f"Camera {i}")
+                cap.release()
+            else:
+                break
+        if self.camera_combo.count() == 0:
+            self.camera_combo.addItem("No cameras found")
+            self.camera_button.setEnabled(False)
+
+    def on_camera_selected(self, index):
+        """Handle camera selection change"""
+        if self.camera_combo.currentText() != "No cameras found":
+            self.selected_camera_index = index
+            # If camera is running, restart it with new selection
+            if hasattr(self, 'camera_thread') and self.camera_thread is not None and self.camera_thread.isRunning():
+                self.stop_camera()
+                self.start_camera()
 
 def main():
     """Main application entry point with asyncio-Qt integration"""
